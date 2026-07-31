@@ -183,7 +183,7 @@ async function restoreFromMongo(){
 
 // Save a file to MongoDB
 async function saveToMongo(relPath, content, isDir=false){
-  if(!db_connected || !FileModel) return;
+  if(!db_connected || !FileModel) return false;
   try {
     const size = Buffer.isBuffer(content) ? content.length : Buffer.byteLength(content||"");
     await FileModel.findOneAndUpdate(
@@ -191,7 +191,8 @@ async function saveToMongo(relPath, content, isDir=false){
       {path:relPath, content: Buffer.isBuffer(content)?content:Buffer.from(content||""), isDir, mtime:new Date(), size},
       {upsert:true, new:true}
     );
-  } catch(e){ console.log("⚠️ mongo save error:", e.message); }
+    return true;
+  } catch(e){ console.log("⚠️ mongo save error:", e.message); return false; }
 }
 
 // Delete from MongoDB
@@ -277,30 +278,46 @@ const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWit
 
 // ── BOT ──
 let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null, _consecutiveCrashes=0;
-let botFbConnected=false, lastActivityTs=null, watchdogTimer=null;
+let botFbConnected=false, lastActivityTs=null, watchdogTimer=null, npmInstalling=false;
 
-// ── npm install রিট্রাই (ব্যাকঅফ সহ) ── Render-এর নেটওয়ার্ক মাঝেমধ্যে npm registry-তে
-// পৌঁছাতে ব্যর্থ হয় (ETIMEDOUT) — একবার fail করলেই থেমে না গিয়ে ৩ বার চেষ্টা করা হয়,
-// প্রতিবার একটু বেশি সময় দিয়ে
-function npmInstallWithRetry(maxAttempts=3){
-  let lastErr=null;
-  for(let attempt=1; attempt<=maxAttempts; attempt++){
-    try{
-      log(`📦 npm install চলছে... (চেষ্টা ${attempt}/${maxAttempts})`,"warn");
-      execSync("npm install",{cwd:BDIR,timeout:180000});
-      log("✅ npm install সম্পন্ন","success");
-      return {ok:true};
-    }catch(e){
-      lastErr=e;
-      log(`⚠️ npm install ব্যর্থ (চেষ্টা ${attempt}/${maxAttempts}): `+e.message,"error");
-      if(attempt<maxAttempts){
-        const waitMs=5000*attempt;
-        log(`⏳ ${Math.round(waitMs/1000)} সেকেন্ড পর আবার চেষ্টা করা হবে...`,"warn");
-        try{execSync(`sleep ${waitMs/1000}`);}catch{}
-      }
+// ── npm install (নন-ব্লকিং, ব্যাকঅফ রিট্রাই সহ) ──
+// আগে execSync দিয়ে করা হতো, যেটা পুরো Node.js ইভেন্ট-লুপ ব্লক করে দিত (৩ মিনিট পর্যন্ত!)।
+// তখন প্যানেল কোনো রিকোয়েস্টের জবাব দিতে পারত না — Render নিজেই origin থেকে সাড়া
+// না পেয়ে "502 Bad Gateway" দেখাত। এখন spawn ব্যবহার করা হচ্ছে যা ব্যাকগ্রাউন্ডে চলে,
+// প্যানেল পুরোটা সময় স্বাভাবিকভাবে সাড়া দিতে থাকে।
+function npmInstallAsync(maxAttempts=3){
+  npmInstalling=true;
+  return new Promise(resolve=>{
+    let attempt=0;
+    function tryOnce(){
+      attempt++;
+      log(`📦 npm install চলছে (ব্যাকগ্রাউন্ডে, প্যানেল সচল থাকবে)... (চেষ্টা ${attempt}/${maxAttempts})`,"warn");
+      const p=spawn("npm",["install","--no-audit","--no-fund"],{cwd:BDIR});
+      let errBuf="";
+      const killT=setTimeout(()=>{try{p.kill("SIGKILL");}catch{}},180000);
+      p.stderr.on("data",d=>{errBuf+=d.toString();});
+      p.on("exit",code=>{
+        clearTimeout(killT);
+        if(code===0){
+          log("✅ npm install সম্পন্ন","success");
+          npmInstalling=false; resolve({ok:true});
+        } else if(attempt<maxAttempts){
+          const waitMs=5000*attempt;
+          log(`⚠️ npm install ব্যর্থ (exit ${code}) — ${Math.round(waitMs/1000)}সে পর আবার চেষ্টা...`,"error");
+          setTimeout(tryOnce,waitMs);
+        } else {
+          log("❌ npm install বারবার ব্যর্থ: "+errBuf.slice(0,300),"error");
+          npmInstalling=false; resolve({ok:false,msg:errBuf.slice(0,300)||("exit code "+code)});
+        }
+      });
+      p.on("error",e=>{
+        clearTimeout(killT);
+        if(attempt<maxAttempts) setTimeout(tryOnce,5000*attempt);
+        else { npmInstalling=false; resolve({ok:false,msg:e.message}); }
+      });
     }
-  }
-  return {ok:false, msg: lastErr?lastErr.message:"unknown error"};
+    tryOnce();
+  });
 }
 
 function bc(d){wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(JSON.stringify(d));});}
@@ -336,13 +353,23 @@ async function getShouldRun(){
 
 function startBot(by="manual"){
   if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
+  if(npmInstalling) return {ok:false,msg:"npm install ইতিমধ্যে ব্যাকগ্রাউন্ডে চলছে, শেষ হলে বট নিজে থেকেই চালু হবে"};
   const idx=["index.js","app.js","main.js","bot.js","start.js"].find(f=>fs.existsSync(path.join(BDIR,f)));
   if(!idx) return {ok:false,msg:"index.js পাওয়া যায়নি — বট আপলোড করুন"};
-  const pkgFile=path.join(BDIR,"package.json");
   const nmDir=path.join(BDIR,"node_modules");
   if(!fs.existsSync(nmDir)){
-    npmInstallWithRetry(3);
+    log("📦 node_modules নেই — npm install ব্যাকগ্রাউন্ডে শুরু হচ্ছে, শেষ হলে বট automatically চালু হবে","warn");
+    npmInstallAsync(3).then(r=>{
+      if(r.ok) launchBotProcess(by, idx);
+      else log("❌ npm install বারবার ব্যর্থ হওয়ায় বট চালু করা যায়নি — নেটওয়ার্ক ঠিক হলে 'Start' আবার চাপো","error");
+    });
+    return {ok:true,msg:"npm install ব্যাকগ্রাউন্ডে চলছে — শেষ হলে বট চালু হবে (লগ ট্যাবে দেখো)"};
   }
+  return launchBotProcess(by, idx);
+}
+
+function launchBotProcess(by, idx){
+  if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
   botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
   botStart=Date.now(); stats.starts++; saveJ(SFILE,stats); savePanelStatsToMongo();
   setShouldRun(true);
@@ -476,9 +503,10 @@ app.post("/api/bot/restart", auth,(req,res)=>{stopBot();setTimeout(()=>res.json(
 app.get("/api/bot/status",   auth,(req,res)=>res.json({running:!!botProc,fbConnected:botFbConnected,uptime:botStart?Math.floor((Date.now()-botStart)/1000):0}));
 app.get("/api/bot/logs",     auth,(req,res)=>res.json({logs:botLogs}));
 app.post("/api/bot/clearlogs",auth,(req,res)=>{botLogs=[];bc({type:"clearLogs"});res.json({ok:true});});
-app.post("/api/bot/install", auth,(req,res)=>{
+app.post("/api/bot/install", auth,async(req,res)=>{
   if(!fs.existsSync(path.join(BDIR,"package.json"))) return res.json({ok:false,msg:"package.json নেই"});
-  const r=npmInstallWithRetry(3);
+  if(npmInstalling) return res.json({ok:false,msg:"npm install ইতিমধ্যে চলছে, লগ দেখো"});
+  const r=await npmInstallAsync(3);
   res.json(r.ok?{ok:true,msg:"npm install সম্পন্ন"}:{ok:false,msg:r.msg});
 });
 app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveCfg();res.json({ok:true,enabled:autoRestart});});
@@ -751,7 +779,11 @@ async function processUploadedFile(filePath, originalName, reqPath){
     fs.copyFileSync(filePath,dst);
     try{fs.unlinkSync(filePath);}catch{}
     const relPath=path.relative(BDIR,dst);
-    await saveToMongo(relPath,fs.readFileSync(dst));
+    const saved=await saveToMongo(relPath,fs.readFileSync(dst));
+    if(!saved && db_connected){
+      log("⚠️ "+originalName+" ডিস্কে সেভ হয়েছে কিন্তু MongoDB তে সেভ ব্যর্থ — Render restart হলে এই ফাইলটা হারিয়ে যাবে","error");
+      return {httpStatus:200, body:{ok:false,msg:`⚠️ ${originalName} সাময়িকভাবে ডিস্কে আছে (কমান্ড এখনই কাজ করবে) কিন্তু MongoDB তে সেভ ব্যর্থ হয়েছে — restart হলে হারিয়ে যাবে, আবার আপলোড করো`}};
+    }
     return {httpStatus:200, body:{ok:true,msg:`✅ ${originalName} আপলোড সম্পন্ন`}};
   }
 }
@@ -958,11 +990,15 @@ server.listen(PORT,()=>{
     connectMongo();
   }catch{
     console.log("⚠️ mongoose not installed — running without MongoDB");
-    console.log("📦 Installing mongoose...");
-    try{
-      execSync("npm install mongoose",{timeout:60000});
-      connectMongo();
-    }catch(e){console.log("mongoose install failed:",e.message);}
+    console.log("📦 Installing mongoose (ব্যাকগ্রাউন্ডে, প্যানেল ততক্ষণে সচল থাকবে)...");
+    const p=spawn("npm",["install","mongoose","--no-audit","--no-fund"]);
+    const killT=setTimeout(()=>{try{p.kill("SIGKILL");}catch{}},60000);
+    p.on("exit",code=>{
+      clearTimeout(killT);
+      if(code===0) connectMongo();
+      else console.log("mongoose install failed, exit code:",code);
+    });
+    p.on("error",e=>console.log("mongoose install failed:",e.message));
   }
 });
 
