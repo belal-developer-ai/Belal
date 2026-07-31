@@ -9,6 +9,7 @@ const path      = require("path");
 const https     = require("https");
 const http2     = require("http");
 const { spawn, execSync } = require("child_process");
+const crypto    = require("crypto");
 const archiver  = require("archiver");
 const unzipper  = require("unzipper");
 
@@ -31,8 +32,10 @@ const BDIR  = path.join(__dirname, "bot");
 const LFILE = path.join(__dirname, "panel.log");
 const SFILE = path.join(__dirname, "stats.json");
 const LTFILE = path.join(__dirname, "lifetime.json"); // panel/bot RAM + mongo ব্যবহারের সর্বকালীন উচ্চতম (lifetime peak) — MongoDB-তেও ব্যাকআপ থাকে, তাই panel restart হলেও হারায় না
+const AFILE = path.join(__dirname, "alerts.json"); // ইন-প্যানেল লাইফটাইম অ্যালার্ট/নোটিফিকেশন হিস্ট্রি — MongoDB-তেও ব্যাকআপ থাকে
 const PORT  = process.env.PORT || 3000;
-const MONGO_URI = process.env.MONGODB_URI || "mongodb+srv://belal:belal123456@cluster0.i1wofni.mongodb.net/botpanel?appName=Cluster0";
+const MONGO_URI = process.env.MONGODB_URI || "";
+if(!MONGO_URI) console.log("⚠️ MONGODB_URI environment variable সেট করা নেই — Render Dashboard → Environment-এ বসাও, নাহলে MongoDB ছাড়া চলবে");
 
 function loadJ(f,def={}){try{return JSON.parse(fs.readFileSync(f,"utf8"));}catch{return def;}}
 function saveJ(f,d){try{fs.writeFileSync(f,JSON.stringify(d,null,2));}catch{}}
@@ -70,6 +73,33 @@ let lifetime = loadJ(LTFILE,{peakPanelMB:0,peakBotMB:0,peakMongoMB:0,firstSeen:n
 const PASS = process.env.PANEL_PASSWORD || cfg.password || "admin123";
 if(!fs.existsSync(BDIR)) fs.mkdirSync(BDIR,{recursive:true});
 
+// ── ইন-প্যানেল লাইফটাইম অ্যালার্ট সিস্টেম (বেল আইকন) ── ফোনে পুশ নোটিফিকেশনের বদলে,
+// সবকিছু ওয়েবসাইটের ভিতরেই। প্রতিটা গুরুত্বপূর্ণ ঘটনা (ক্র্যাশ, npm install ব্যর্থতা,
+// প্রতিরোধমূলক রিস্টার্ট, স্টোরেজ সতর্কতা) এখানে জমা থাকে, MongoDB-তে ব্যাকআপসহ
+let alerts = loadJ(AFILE, []);
+let _alertCooldowns = {};
+function notify(level, title, message, {cooldownKey=null, cooldownMs=0} = {}){
+  if(cooldownKey){
+    const last=_alertCooldowns[cooldownKey]||0;
+    if(Date.now()-last < cooldownMs) return; // এখনো কুলডাউনে, স্কিপ
+    _alertCooldowns[cooldownKey]=Date.now();
+  }
+  const entry = { id: Date.now()+"-"+Math.random().toString(36).slice(2,7), time: new Date().toISOString(), level, title, message, read:false };
+  alerts.push(entry);
+  if(alerts.length>500) alerts.shift();
+  saveJ(AFILE, alerts);
+  saveAlertsToMongo();
+  bc({type:"alert", data: entry});
+}
+async function saveAlertsToMongo(){ await saveToMongo("__panel_alerts__", JSON.stringify(alerts), false); }
+async function restoreAlertsFromMongo(){
+  if(!db_connected || !FileModel) return;
+  try{
+    const a = await FileModel.findOne({path:"__panel_alerts__"});
+    if(a && a.content){ try{ alerts = JSON.parse(a.content.toString()); saveJ(AFILE, alerts); }catch{} }
+  }catch(e){ console.log("⚠️ alerts restore error:", e.message); }
+}
+
 // ── MONGODB ──
 let mongoose, FileModel, db_connected = false;
 
@@ -94,6 +124,7 @@ async function connectMongo(){
 
     // restore files from MongoDB on startup
     await restorePanelPersistent();
+    await restoreAlertsFromMongo();
     await restoreFromMongo();
     await importRepoZipIfPresent();
 
@@ -280,38 +311,144 @@ const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWit
 let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null, _consecutiveCrashes=0;
 let botFbConnected=false, lastActivityTs=null, watchdogTimer=null, npmInstalling=false;
 
-// ── npm install (নন-ব্লকিং, ব্যাকঅফ রিট্রাই সহ) ──
+// ── npm install (নন-ব্লকিং, ব্যাকঅফ রিট্রাই + node_modules ক্যাশ সহ) ──
 // আগে execSync দিয়ে করা হতো, যেটা পুরো Node.js ইভেন্ট-লুপ ব্লক করে দিত (৩ মিনিট পর্যন্ত!)।
 // তখন প্যানেল কোনো রিকোয়েস্টের জবাব দিতে পারত না — Render নিজেই origin থেকে সাড়া
 // না পেয়ে "502 Bad Gateway" দেখাত। এখন spawn ব্যবহার করা হচ্ছে যা ব্যাকগ্রাউন্ডে চলে,
 // প্যানেল পুরোটা সময় স্বাভাবিকভাবে সাড়া দিতে থাকে।
+//
+// Render ফ্রি প্ল্যানে ডিস্ক ephemeral — প্রতিবার container fresh হলে node_modules
+// আবার install করতে হয় (৩-৫ মিনিট, আর native প্যাকেজ থাকলে RAM ঝুঁকিও থাকে)। তাই
+// একবার সফলভাবে install হলে সেটাকে zip করে MongoDB (GridFS) এ ক্যাশ করে রাখা হয় —
+// পরের বার শুধু ডাউনলোড করেই বসিয়ে দেওয়া যায়, npm install লাগেই না।
+const NM_CACHE_MAX_MB = 350; // MongoDB ফ্রি প্ল্যানের ৫১২MB সীমা বাঁচাতে
+function botPackageHash(){
+  try{
+    const p = path.join(BDIR,"package.json");
+    if(!fs.existsSync(p)) return null;
+    return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+  }catch{return null;}
+}
+function getNmBucket(){
+  const { GridFSBucket } = require("mongodb");
+  return new GridFSBucket(mongoose.connection.db, { bucketName: "node_modules_cache" });
+}
+async function cacheNodeModulesNow(){
+  if(!db_connected) return;
+  const nmPath = path.join(BDIR,"node_modules");
+  if(!fs.existsSync(nmPath)) return;
+  const hash = botPackageHash();
+  if(!hash) return;
+  const tmpZip = path.join(require("os").tmpdir(), "nm_cache_"+Date.now()+".zip");
+  try{
+    log("📦 node_modules MongoDB-তে ক্যাশ করা হচ্ছে (পরের বার দ্রুত চালুর জন্য)...","info");
+    await new Promise((resolve,reject)=>{
+      const output = fs.createWriteStream(tmpZip);
+      const archive = archiver("zip",{zlib:{level:6}});
+      archive.pipe(output); archive.directory(nmPath,false); archive.finalize();
+      output.on("close",resolve); archive.on("error",reject);
+    });
+    const stat = fs.statSync(tmpZip);
+    const sizeMB = Math.round(stat.size/1024/1024);
+    if(stat.size > NM_CACHE_MAX_MB*1024*1024){
+      log(`⚠️ node_modules ক্যাশ (${sizeMB}MB) সীমার (${NM_CACHE_MAX_MB}MB) চেয়ে বড় — MongoDB স্টোরেজ বাঁচাতে ক্যাশ স্কিপ করা হলো।`,"warn");
+      fs.unlinkSync(tmpZip); return;
+    }
+    const bucket = getNmBucket();
+    const old = await bucket.find({filename:"node_modules.zip"}).toArray();
+    for(const f of old) await bucket.delete(f._id).catch(()=>{});
+    await new Promise((resolve,reject)=>{
+      fs.createReadStream(tmpZip).pipe(bucket.openUploadStream("node_modules.zip",{metadata:{hash}}))
+        .on("finish",resolve).on("error",reject);
+    });
+    await FileModel.findOneAndUpdate(
+      {path:"__nm_cache_meta__"},
+      {path:"__nm_cache_meta__", content:Buffer.from(JSON.stringify({hash,sizeMB,cachedAt:Date.now()})), isDir:false, mtime:new Date(), size:sizeMB},
+      {upsert:true}
+    );
+    log(`✅ node_modules ক্যাশ সম্পন্ন (${sizeMB}MB) — পরের বার npm install ছাড়াই কয়েক সেকেন্ডে চালু হবে।`,"success");
+  }catch(e){
+    log("⚠️ node_modules ক্যাশ করা ব্যর্থ (সমস্যা নেই, স্বাভাবিক ইনস্টল চলবে): "+e.message,"warn");
+  }finally{
+    try{ fs.unlinkSync(tmpZip); }catch{}
+  }
+}
+async function tryRestoreNodeModulesCache(){
+  if(!db_connected) return false;
+  const hash = botPackageHash();
+  if(!hash) return false;
+  try{
+    const metaDoc = await FileModel.findOne({path:"__nm_cache_meta__"});
+    if(!metaDoc || !metaDoc.content) return false;
+    const meta = JSON.parse(metaDoc.content.toString());
+    if(meta.hash !== hash) return false; // package.json পাল্টেছে, ক্যাশ পুরনো
+    const bucket = getNmBucket();
+    const files = await bucket.find({filename:"node_modules.zip"}).toArray();
+    if(!files.length) return false;
+    log(`📥 MongoDB-তে ক্যাশ করা node_modules (${meta.sizeMB}MB) পাওয়া গেছে — ডাউনলোড করে বসানো হচ্ছে...`,"info");
+    const os = require("os");
+    const tmpZip = path.join(os.tmpdir(), "nm_restore_"+Date.now()+".zip");
+    await new Promise((resolve,reject)=>{
+      bucket.openDownloadStreamByName("node_modules.zip").pipe(fs.createWriteStream(tmpZip)).on("finish",resolve).on("error",reject);
+    });
+    const nmPath = path.join(BDIR,"node_modules");
+    fs.mkdirSync(nmPath,{recursive:true});
+    await fs.createReadStream(tmpZip).pipe(unzipper.Extract({path:nmPath})).promise();
+    fs.unlinkSync(tmpZip);
+    log(`⚡ node_modules ক্যাশ থেকে রিস্টোর সম্পন্ন (${meta.sizeMB}MB) — npm install লাগেনি!`,"success");
+    return true;
+  }catch(e){
+    log("⚠️ ক্যাশ রিস্টোর ব্যর্থ, স্বাভাবিক ইনস্টল চলবে: "+e.message,"warn");
+    return false;
+  }
+}
+
 function npmInstallAsync(maxAttempts=3){
   npmInstalling=true;
   return new Promise(resolve=>{
     let attempt=0;
     function tryOnce(){
       attempt++;
-      log(`📦 npm install চলছে (ব্যাকগ্রাউন্ডে, প্যানেল সচল থাকবে)... (চেষ্টা ${attempt}/${maxAttempts})`,"warn");
-      const p=spawn("npm",["install","--no-audit","--no-fund"],{cwd:BDIR});
+      const ramBefore = Math.round(process.memoryUsage().rss/1024/1024);
+      const hasLock = fs.existsSync(path.join(BDIR,"package-lock.json"));
+      const npmArgs = hasLock
+        ? ["ci","--omit=dev","--no-audit","--no-fund"]
+        : ["install","--omit=dev","--no-audit","--no-fund","--prefer-offline"];
+      log(`📦 npm ${npmArgs[0]} চলছে (ব্যাকগ্রাউন্ডে, প্যানেল সচল থাকবে, RAM: ${ramBefore}MB)... (চেষ্টা ${attempt}/${maxAttempts})`,"warn");
+      const p=spawn("npm",npmArgs,{cwd:BDIR});
       let errBuf="";
-      const killT=setTimeout(()=>{try{p.kill("SIGKILL");}catch{}},180000);
+      // প্রতি মিনিটে "এখনো চলছে" আপডেট — যাতে বোঝা যায় আটকে যায়নি, নাকি স্বাভাবিক ধীরগতি
+      const startedAt=Date.now();
+      const heartbeat=setInterval(()=>{
+        const mins=Math.round((Date.now()-startedAt)/60000);
+        log(`⏳ npm install এখনো চলছে (${mins} মিনিট পার হয়েছে)...`,"info");
+      },60*1000);
+      // নিরাপত্তা: ২০ মিনিটেও শেষ না হলে (native কম্পাইল স্লো হতে পারে) চিরস্থায়ী আটকে
+      // থাকা এড়াতে জোর করে বন্ধ করে দেওয়া হবে
+      const killT=setTimeout(()=>{
+        log("⚠️ npm install ২০ মিনিটেও শেষ হয়নি — জোর করে বন্ধ করা হলো","error");
+        try{p.kill("SIGKILL");}catch{}
+      },20*60*1000);
       p.stderr.on("data",d=>{errBuf+=d.toString();});
       p.on("exit",code=>{
-        clearTimeout(killT);
+        clearTimeout(killT); clearInterval(heartbeat);
+        const ramAfter=Math.round(process.memoryUsage().rss/1024/1024);
         if(code===0){
-          log("✅ npm install সম্পন্ন","success");
-          npmInstalling=false; resolve({ok:true});
+          log(`✅ npm install সম্পন্ন (RAM এখন: ${ramAfter}MB)`,"success");
+          npmInstalling=false;
+          cacheNodeModulesNow().catch(()=>{}).finally(()=>resolve({ok:true}));
         } else if(attempt<maxAttempts){
           const waitMs=5000*attempt;
-          log(`⚠️ npm install ব্যর্থ (exit ${code}) — ${Math.round(waitMs/1000)}সে পর আবার চেষ্টা...`,"error");
+          log(`⚠️ npm install ব্যর্থ (exit ${code}, RAM: ${ramAfter}MB) — ${Math.round(waitMs/1000)}সে পর আবার চেষ্টা...`,"error");
           setTimeout(tryOnce,waitMs);
         } else {
           log("❌ npm install বারবার ব্যর্থ: "+errBuf.slice(0,300),"error");
+          notify("error","⚠️ npm install ব্যর্থ","বট চালু করা যায়নি — dependency install fail করেছে। প্যানেলের লগ দেখো।");
           npmInstalling=false; resolve({ok:false,msg:errBuf.slice(0,300)||("exit code "+code)});
         }
       });
       p.on("error",e=>{
-        clearTimeout(killT);
+        clearTimeout(killT); clearInterval(heartbeat);
         if(attempt<maxAttempts) setTimeout(tryOnce,5000*attempt);
         else { npmInstalling=false; resolve({ok:false,msg:e.message}); }
       });
@@ -358,12 +495,19 @@ function startBot(by="manual"){
   if(!idx) return {ok:false,msg:"index.js পাওয়া যায়নি — বট আপলোড করুন"};
   const nmDir=path.join(BDIR,"node_modules");
   if(!fs.existsSync(nmDir)){
-    log("📦 node_modules নেই — npm install ব্যাকগ্রাউন্ডে শুরু হচ্ছে, শেষ হলে বট automatically চালু হবে","warn");
-    npmInstallAsync(3).then(r=>{
-      if(r.ok) launchBotProcess(by, idx);
-      else log("❌ npm install বারবার ব্যর্থ হওয়ায় বট চালু করা যায়নি — নেটওয়ার্ক ঠিক হলে 'Start' আবার চাপো","error");
-    });
-    return {ok:true,msg:"npm install ব্যাকগ্রাউন্ডে চলছে — শেষ হলে বট চালু হবে (লগ ট্যাবে দেখো)"};
+    log("🔎 বটের node_modules নেই — আগে MongoDB ক্যাশ চেক করা হচ্ছে...","info");
+    npmInstalling=true;
+    (async()=>{
+      const restored=await tryRestoreNodeModulesCache().catch(()=>false);
+      npmInstalling=false;
+      if(restored){ launchBotProcess(by, idx); return; }
+      log("📦 ক্যাশ পাওয়া যায়নি — npm install ব্যাকগ্রাউন্ডে শুরু হচ্ছে, শেষ হলে বট automatically চালু হবে","warn");
+      npmInstallAsync(3).then(r=>{
+        if(r.ok) launchBotProcess(by, idx);
+        else log("❌ npm install বারবার ব্যর্থ হওয়ায় বট চালু করা যায়নি — নেটওয়ার্ক ঠিক হলে 'Start' আবার চাপো","error");
+      });
+    })();
+    return {ok:true,msg:"📦 dependency চেক/ইনস্টল ব্যাকগ্রাউন্ডে শুরু হয়েছে — একটু পর বট নিজে থেকেই চালু হয়ে যাবে"};
   }
   return launchBotProcess(by, idx);
 }
@@ -405,6 +549,7 @@ function launchBotProcess(by, idx){
           time: new Date().toISOString(), code: code||sig, uptimeSec: up
         }));
       }catch{}
+      notify("error","🔴 বট ক্র্যাশ করেছে!",`কোড: ${code||sig} | আগের সেশন সচল ছিল: ${fmtS(up)} | Auto-restart চেষ্টা চলছে...`);
     }
     saveJ(SFILE,stats); savePanelStatsToMongo();
     log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
@@ -447,6 +592,53 @@ setInterval(()=>{
     setTimeout(()=>startBot("watchdog"),3000);
   }
 },2*60*1000);
+
+// ── কানেকশন-রিফ্রেশ (প্রতি ৬ ঘণ্টায়) ──
+// fca-unofficial (unofficial FB API লাইব্রেরি)-র একটা পরিচিত সমস্যা আছে: বট প্রসেস বেঁচে থাকে
+// (প্যানেলে "চলছে" দেখায়) কিন্তু Facebook-এর real-time message listener (MQTT) মাঝে মাঝে
+// নিঃশব্দে বন্ধ হয়ে যায় — কোনো ক্র্যাশ ছাড়াই, তাই প্যানেল এটা সাথে সাথে ধরতে পারে না।
+// এটা কোড দিয়ে ১০০% বন্ধ করা যায় না (unofficial API-র নিজস্ব সীমাবদ্ধতা), কিন্তু নিয়মিত
+// বিরতিতে connection রিফ্রেশ করলে ঝুঁকি অনেকটাই কমে।
+setInterval(()=>{
+  if(!botProc || !botFbConnected || !botStart) return;
+  const upHours=(Date.now()-botStart)/(3600*1000);
+  if(upHours>=6){
+    log("🔄 কানেকশন-রিফ্রেশ — Facebook-এর real-time listener নিঃশব্দে বন্ধ হওয়া ঠেকাতে প্রতিরোধমূলক রিস্টার্ট","warn");
+    notify("info","🔄 কানেকশন-রিফ্রেশ","প্রতি ৬ ঘণ্টায় প্রতিরোধমূলক রিস্টার্ট হয়েছে (Facebook listener সতেজ রাখতে)।",{cooldownKey:"conn-refresh",cooldownMs:5*60*60*1000});
+    stopBot(); setTimeout(()=>startBot("connection-refresh"),3000);
+  }
+},10*60*1000);
+
+// ── প্রতিরোধমূলক RAM গার্ড ── প্রতি ৩০ সেকেন্ডে চেক করা হয় — RAM যদি ক্রমাগত ৪৭০MB+
+// থাকে (Render-এর ৫১২MB হার্ড সীমার কাছাকাছি), তাহলে OOM crash হওয়ার আগেই বট নিজে
+// থেকে গ্রেসফুলি রিস্টার্ট করে দেয়
+let _highRamStreak=0;
+setInterval(()=>{
+  if(!botProc){_highRamStreak=0;return;}
+  const botMB=getBotMemMB();
+  if(botMB==null) return;
+  if(botMB>=470){
+    _highRamStreak++;
+    if(_highRamStreak>=3){ // পরপর ৩ বার (≈১.৫ মিনিট) উচ্চ থাকলেই তবে রিস্টার্ট — এক-দুইবারের স্পাইকে না
+      log(`🛡️ প্রতিরোধমূলক রিস্টার্ট — বট RAM ${botMB}MB (৫১২MB সীমার কাছাকাছি)`,"warn");
+      notify("warn","🛡️ প্রতিরোধমূলক রিস্টার্ট",`বট RAM ${botMB}MB ছুঁয়ে ফেলেছিল (সীমা ৫১২MB) — ক্র্যাশ হওয়ার আগেই নিজে থেকে নিরাপদে রিস্টার্ট করা হলো।`,{cooldownKey:"preventive-restart",cooldownMs:10*60*1000});
+      _highRamStreak=0;
+      stopBot(); setTimeout(()=>startBot("preventive-ram-guard"),3000);
+    }
+  } else { _highRamStreak=0; }
+},30*1000);
+
+// ── MongoDB স্টোরেজ প্রায় শেষ হয়ে গেলে দিনে একবার সতর্ক করা ──
+setInterval(async()=>{
+  if(!db_connected || !mongoose?.connection?.db) return;
+  try{
+    const s=await mongoose.connection.db.stats();
+    const usedMB=(s.dataSize+s.indexSize)/1024/1024;
+    if(usedMB>512*0.85){
+      notify("warn","⚠️ MongoDB স্টোরেজ প্রায় শেষ",`${Math.round(usedMB)}MB / 512MB ব্যবহার হয়ে গেছে (Atlas M0 ফ্রি সীমা)। পুরনো/অপ্রয়োজনীয় ডেটা সরানো দরকার হতে পারে।`,{cooldownKey:"mongo-storage-warn",cooldownMs:24*60*60*1000});
+    }
+  }catch{}
+},30*60*1000);
 
 // ── SELF PING ──
 function selfPing(){
@@ -624,6 +816,84 @@ app.get("/api/file/read",auth,(req,res)=>{
     if(s.size>5*1024*1024) return res.json({error:"ফাইল অনেক বড় (5MB+)"});
     res.json({content:fs.readFileSync(f,"utf8"),size:s.size});
   }catch(e){res.status(500).json({error:e.message});}
+});
+
+// ── কমান্ড ফাইল টেস্টার (নন-ব্লকিং) ──
+// পুরনো প্যানেলে এখানে spawnSync ব্যবহার হতো, যেটা প্রতিবার "🧪 টেস্ট" চাপলেই পুরো
+// ইভেন্ট-লুপ কয়েক সেকেন্ডের জন্য ব্লক করে দিত — পুরনো স্ক্রিনশটে যে "শুধু লোডিং" bug
+// দেখানো হয়েছিল তার আসল কারণ এটাই ছিল। এখন async spawn, প্যানেল ব্লক হয় না।
+function spawnAsync(cmd,args,opts={}){
+  return new Promise(resolve=>{
+    const p=spawn(cmd,args,{...opts});
+    let out="",err="";
+    const killT=setTimeout(()=>{try{p.kill("SIGKILL");}catch{}},opts.timeout||10000);
+    p.stdout&&p.stdout.on("data",d=>out+=d.toString());
+    p.stderr&&p.stderr.on("data",d=>err+=d.toString());
+    p.on("exit",code=>{clearTimeout(killT);resolve({status:code,stdout:out,stderr:err});});
+    p.on("error",e=>{clearTimeout(killT);resolve({status:-1,stdout:"",stderr:e.message});});
+  });
+}
+function testUrl(url){
+  return new Promise(resolve=>{
+    try{
+      const mod=url.startsWith("https")?https:http2;
+      const req=mod.request(url,{method:"HEAD",timeout:6000},r=>{resolve({url,ok:r.statusCode<400,status:r.statusCode});r.resume();});
+      req.on("timeout",()=>{req.destroy();resolve({url,ok:false,status:"timeout"});});
+      req.on("error",e=>resolve({url,ok:false,status:"error: "+e.message}));
+      req.end();
+    }catch(e){resolve({url,ok:false,status:"error: "+e.message});}
+  });
+}
+app.post("/api/file/test",auth,async(req,res)=>{
+  try{
+    const f=safe(BDIR,req.body.path);
+    if(!fs.existsSync(f)) return res.json({ok:false,msg:"ফাইল খুঁজে পাওয়া যায়নি"});
+    const content=fs.readFileSync(f,"utf8");
+    const result={syntax:null,structure:null,dependencies:[],apis:[]};
+    const chk=await spawnAsync(process.execPath,["--check",f],{timeout:10000});
+    result.syntax=chk.status===0
+      ? {ok:true,msg:"সিনট্যাক্স ঠিক আছে ✅"}
+      : {ok:false,msg:(chk.stderr||"").split("\n").slice(0,4).join(" ")||"সিনট্যাক্স এরর"};
+    if(result.syntax.ok){
+      const probe=await spawnAsync(process.execPath,["-e",`
+        try{
+          const cmd = require(${JSON.stringify(f)});
+          const out = {
+            hasConfig: !!(cmd && cmd.config),
+            name: cmd?.config?.name || null,
+            aliases: cmd?.config?.aliases || [],
+            hasRunFn: !!(cmd && (cmd.run || cmd.onStart || cmd.onCall)),
+            dependencies: cmd?.config?.dependencies || {}
+          };
+          console.log("###RESULT###"+JSON.stringify(out));
+        }catch(e){ console.log("###ERROR###"+e.message); }
+      `],{cwd:path.dirname(f),timeout:8000});
+      const out=probe.stdout||"";
+      if(out.includes("###ERROR###")){
+        result.structure={ok:false,msg:"ফাইল লোড করতে ব্যর্থ: "+out.split("###ERROR###")[1].trim().slice(0,200)};
+      } else if(out.includes("###RESULT###")){
+        try{
+          const parsed=JSON.parse(out.split("###RESULT###")[1].trim());
+          const problems=[];
+          if(!parsed.hasConfig) problems.push("module.exports.config নেই");
+          if(!parsed.name) problems.push("config.name নেই");
+          if(!parsed.hasRunFn) problems.push("run/onStart/onCall ফাংশন নেই");
+          result.structure=problems.length
+            ? {ok:false,msg:"সমস্যা: "+problems.join(", ")}
+            : {ok:true,msg:`ঠিক আছে ✅ — নাম: "${parsed.name}"${parsed.aliases.length?", alias: "+parsed.aliases.join(", "):""}`};
+          for(const [pkg] of Object.entries(parsed.dependencies||{})){
+            try{require.resolve(pkg,{paths:[path.join(BDIR,"node_modules")]});result.dependencies.push({pkg,ok:true});}
+            catch{result.dependencies.push({pkg,ok:false});}
+          }
+        }catch{result.structure={ok:false,msg:"ফলাফল পার্স করতে ব্যর্থ"};}
+      } else {
+        result.structure={ok:false,msg:"টাইমআউট বা কোনো আউটপুট পাওয়া যায়নি (৮ সেকেন্ডের বেশি সময় নিয়েছে)"};
+      }
+      const urls=[...new Set((content.match(/https?:\/\/[^\s"'`)]+/g)||[]))].slice(0,5);
+      result.apis=await Promise.all(urls.map(testUrl));
+    }
+    res.json({ok:true,result});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
 });
 
 app.post("/api/file/save",auth,async(req,res)=>{
@@ -955,6 +1225,8 @@ app.post("/api/cookie/save",auth,async(req,res)=>{
 });
 
 // ── SETTINGS ──
+app.get("/api/alerts",auth,(req,res)=>res.json({alerts: alerts.slice().reverse()}));
+app.post("/api/alerts/clear",auth,(req,res)=>{alerts=[];saveJ(AFILE,alerts);saveAlertsToMongo();res.json({ok:true});});
 app.get("/api/settings",auth,(req,res)=>res.json({...cfg,mongoConnected:db_connected}));
 app.post("/api/settings/save",auth,(req,res)=>{
   Object.assign(cfg,req.body);
@@ -1072,6 +1344,26 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .dot.on{background:var(--gr);box-shadow:0 0 8px var(--gr);animation:blink 2s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .top-out{padding:6px 10px;border-radius:8px;border:1px solid rgba(240,82,82,.3);background:transparent;color:var(--rd);font-size:11px;cursor:pointer}
+.bell-btn{position:relative;background:transparent;border:1px solid var(--bd);border-radius:9px;padding:5px 9px;font-size:15px;cursor:pointer;color:var(--tx)}
+.bell-badge{position:absolute;top:-5px;right:-5px;background:var(--rd);color:#fff;font-size:9px;font-weight:800;min-width:16px;height:16px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 3px}
+.alert-banner{position:fixed;top:58px;left:8px;right:8px;z-index:500;display:flex;flex-direction:column;gap:6px;pointer-events:none}
+.alert-banner-item{pointer-events:auto;background:var(--s2);border:1px solid var(--bd);border-left:4px solid var(--bl);border-radius:10px;padding:10px 12px;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.4);animation:alertSlide .3s ease;display:flex;gap:8px;align-items:flex-start}
+.alert-banner-item.error{border-left-color:var(--rd)}
+.alert-banner-item.warn{border-left-color:var(--yw)}
+.alert-banner-item.info{border-left-color:var(--bl)}
+@keyframes alertSlide{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}
+.alert-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:600}
+.alert-overlay.show{display:block}
+.alert-drawer{position:fixed;top:0;right:-100%;width:min(420px,92vw);height:100%;background:var(--s1);z-index:601;transition:right .25s ease;box-shadow:-10px 0 40px rgba(0,0,0,.5);display:flex;flex-direction:column}
+.alert-drawer.show{right:0}
+.alert-drawer-head{display:flex;justify-content:space-between;align-items:center;padding:16px;border-bottom:1px solid var(--bd)}
+.alert-list{flex:1;overflow-y:auto;padding:10px}
+.alert-item{background:var(--s2);border-left:3px solid var(--bd);border-radius:8px;padding:10px 12px;margin-bottom:8px;font-size:12px}
+.alert-item.error{border-left-color:var(--rd)}
+.alert-item.warn{border-left-color:var(--yw)}
+.alert-item.info{border-left-color:var(--bl)}
+.alert-item-title{font-weight:700;margin-bottom:3px}
+.alert-item-time{font-size:10px;color:var(--mu);margin-top:4px}
 .tabs{position:fixed;bottom:0;left:0;right:0;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-top:1px solid var(--bd);display:grid;grid-template-columns:repeat(5,1fr);height:60px;z-index:200;padding-bottom:env(safe-area-inset-bottom)}
 .tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;cursor:pointer;border:none;background:transparent;color:var(--mu);transition:.15s;position:relative}
 .tab.active{color:var(--ac)}
@@ -1224,8 +1516,22 @@ textarea.ci:focus{border-color:var(--ac)}
     <div class="top-pill"><div class="dot" id="tDot"></div><span id="tStatus">লোড...</span></div>
     <div class="top-pill" id="mongoPill"><div class="dot" id="mongoDot"></div><span id="mongoStatus">DB</span></div>
   </div>
+  <button class="bell-btn" onclick="openAlerts()">🔔<span class="bell-badge" id="bellBadge" style="display:none">0</span></button>
   <button class="top-out" onclick="location.href='/logout'">বের</button>
 </div>
+
+<div id="alertBanner" class="alert-banner"></div>
+<div id="alertDrawer" class="alert-drawer">
+  <div class="alert-drawer-head">
+    <div style="font-weight:800;font-size:15px">🔔 নোটিফিকেশন (লাইফটাইম)</div>
+    <div style="display:flex;gap:8px">
+      <button class="tbtn" onclick="clearAlerts()">🗑 মুছো</button>
+      <button class="tbtn" onclick="closeAlerts()">✕ বন্ধ</button>
+    </div>
+  </div>
+  <div id="alertList" class="alert-list"></div>
+</div>
+<div id="alertOverlay" class="alert-overlay" onclick="closeAlerts()"></div>
 
 <div class="main">
 
@@ -1539,9 +1845,53 @@ function connectWS(){
     if(m.type==="status") updateStatus(m.running,m.fbConnected);
     if(m.type==="clearLogs") document.getElementById("lbox").innerHTML="";
     if(m.type==="mongo") updateMongo(m.connected);
+    if(m.type==="alert"){ showAlertBanner(m.data); _alertsCache.unshift(m.data); _unreadAlerts++; updateBellBadge(); if(document.getElementById("alertDrawer").classList.contains("show")) renderAlertList(); }
   };
   ws.onclose=()=>setTimeout(connectWS,3000);
 }
+
+// ── ইন-প্যানেল অ্যালার্ট সিস্টেম (বেল আইকন) ──
+let _alertsCache=[], _unreadAlerts=0;
+const _lvlIcon={info:"ℹ️",warn:"⚠️",error:"🔴"};
+function showAlertBanner(a){
+  const box=document.getElementById("alertBanner");
+  const d=document.createElement("div");
+  d.className="alert-banner-item "+(a.level||"info");
+  d.innerHTML='<span>'+(_lvlIcon[a.level]||"ℹ️")+'</span><div><b>'+esc(a.title)+'</b><div style="color:var(--mu);margin-top:2px">'+esc(a.message)+'</div></div><span class="ab-x" onclick="this.parentElement.remove()" style="cursor:pointer">✕</span>';
+  box.appendChild(d);
+  setTimeout(()=>{ if(d.parentElement) d.remove(); }, 8000);
+}
+function updateBellBadge(){
+  const b=document.getElementById("bellBadge");
+  if(_unreadAlerts>0){ b.style.display="flex"; b.textContent=_unreadAlerts>99?"99+":_unreadAlerts; }
+  else b.style.display="none";
+}
+function renderAlertList(){
+  const list=document.getElementById("alertList");
+  if(!_alertsCache.length){ list.innerHTML='<div style="text-align:center;color:var(--mu);padding:30px 10px">🔕 কোনো নোটিফিকেশন নেই</div>'; return; }
+  list.innerHTML=_alertsCache.map(a=>
+    '<div class="alert-item '+(a.level||"info")+'"><div class="alert-item-title">'+(_lvlIcon[a.level]||"ℹ️")+' '+esc(a.title)+'</div><div>'+esc(a.message)+'</div><div class="alert-item-time">'+new Date(a.time).toLocaleString("bn-BD")+'</div></div>'
+  ).join("");
+}
+async function openAlerts(){
+  document.getElementById("alertDrawer").classList.add("show");
+  document.getElementById("alertOverlay").classList.add("show");
+  _unreadAlerts=0; updateBellBadge();
+  try{ const d=await fetch("/api/alerts").then(r=>r.json()); _alertsCache=d.alerts||[]; }catch{}
+  renderAlertList();
+}
+function closeAlerts(){
+  document.getElementById("alertDrawer").classList.remove("show");
+  document.getElementById("alertOverlay").classList.remove("show");
+}
+async function clearAlerts(){
+  if(!confirm("সব নোটিফিকেশন মুছবে?")) return;
+  await fetch("/api/alerts/clear",{method:"POST"});
+  _alertsCache=[]; renderAlertList();
+}
+(async function initAlerts(){
+  try{ const d=await fetch("/api/alerts").then(r=>r.json()); _alertsCache=d.alerts||[]; }catch{}
+})();
 
 function appendLog(e){
   if(logFilter!=="all"&&e.type!==logFilter)return;
