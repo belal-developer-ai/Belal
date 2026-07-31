@@ -277,6 +277,31 @@ const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWit
 
 // ── BOT ──
 let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null, _consecutiveCrashes=0;
+let botFbConnected=false, lastActivityTs=null, watchdogTimer=null;
+
+// ── npm install রিট্রাই (ব্যাকঅফ সহ) ── Render-এর নেটওয়ার্ক মাঝেমধ্যে npm registry-তে
+// পৌঁছাতে ব্যর্থ হয় (ETIMEDOUT) — একবার fail করলেই থেমে না গিয়ে ৩ বার চেষ্টা করা হয়,
+// প্রতিবার একটু বেশি সময় দিয়ে
+function npmInstallWithRetry(maxAttempts=3){
+  let lastErr=null;
+  for(let attempt=1; attempt<=maxAttempts; attempt++){
+    try{
+      log(`📦 npm install চলছে... (চেষ্টা ${attempt}/${maxAttempts})`,"warn");
+      execSync("npm install",{cwd:BDIR,timeout:180000});
+      log("✅ npm install সম্পন্ন","success");
+      return {ok:true};
+    }catch(e){
+      lastErr=e;
+      log(`⚠️ npm install ব্যর্থ (চেষ্টা ${attempt}/${maxAttempts}): `+e.message,"error");
+      if(attempt<maxAttempts){
+        const waitMs=5000*attempt;
+        log(`⏳ ${Math.round(waitMs/1000)} সেকেন্ড পর আবার চেষ্টা করা হবে...`,"warn");
+        try{execSync(`sleep ${waitMs/1000}`);}catch{}
+      }
+    }
+  }
+  return {ok:false, msg: lastErr?lastErr.message:"unknown error"};
+}
 
 function bc(d){wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(JSON.stringify(d));});}
 
@@ -316,20 +341,33 @@ function startBot(by="manual"){
   const pkgFile=path.join(BDIR,"package.json");
   const nmDir=path.join(BDIR,"node_modules");
   if(!fs.existsSync(nmDir)){
-    try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ npm install সম্পন্ন","success");}
-    catch(e){log("⚠️ npm install সমস্যা: "+e.message,"error");}
+    npmInstallWithRetry(3);
   }
   botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
   botStart=Date.now(); stats.starts++; saveJ(SFILE,stats); savePanelStatsToMongo();
   setShouldRun(true);
-  log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true});
+  botFbConnected=false; lastActivityTs=Date.now();
+  log(`🟢 বট চালু (${by}) — ${idx}`,"success"); bc({type:"status",running:true,fbConnected:false});
   const NOISY=[/Warning: Accessing non-existent property/i,/circular dependency/i,/--trace-warnings/i,/\[DEP\d+\]/i,/is deprecated\. Please use/i];
   const isNoisy=s=>NOISY.some(rx=>rx.test(s));
   // eslint-disable-next-line no-control-regex
   const stripAnsi=s=>s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g,"");
-  botProc.stdout.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"info");});
-  botProc.stderr.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s&&!isNoisy(s))log(s,"error");});
+  // Messenger-এ আসলেই কানেক্টেড কিনা তা প্রসেস জীবিত থাকা দিয়ে বোঝা যায় না —
+  // login সফল হলে ও mqtt heartbeat এলে তবেই সত্যিকারের "সংযুক্ত" ধরা হচ্ছে
+  const LOGIN_OK=/Logged in as|Done logging in/i;
+  const HEARTBEAT=/listenMqtt|ScreenTime and Badge telemetry/i;
+  botProc.stdout.on("data",d=>{
+    const s=stripAnsi(d.toString()).trim();
+    if(!s) return;
+    lastActivityTs=Date.now();
+    if(LOGIN_OK.test(s)||HEARTBEAT.test(s)){
+      if(!botFbConnected){botFbConnected=true;bc({type:"status",running:true,fbConnected:true});}
+    }
+    if(!isNoisy(s))log(s,"info");
+  });
+  botProc.stderr.on("data",d=>{const s=stripAnsi(d.toString()).trim();if(s){lastActivityTs=Date.now();if(!isNoisy(s))log(s,"error");}});
   botProc.on("exit",(code,sig)=>{
+    botFbConnected=false;
     const up=botStart?Math.floor((Date.now()-botStart)/1000):0;
     stats.totalUptime+=up; stats.history.push({date:new Date().toISOString(),uptime:up,code:code||sig});
     if(stats.history.length>100) stats.history.shift();
@@ -343,7 +381,7 @@ function startBot(by="manual"){
     }
     saveJ(SFILE,stats); savePanelStatsToMongo();
     log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
-    botProc=null; botStart=null; bc({type:"status",running:false});
+    botProc=null; botStart=null; botFbConnected=false; bc({type:"status",running:false,fbConnected:false});
     if(autoRestart&&code!==0&&code!==null){
       // ── উঠতি-ধাপে অপেক্ষা (exponential backoff) ──
       // দ্রুত/বারবার ক্র্যাশ হলে (বিশেষত ফেসবুকের 429 rate-limit) প্রতিবার
@@ -363,11 +401,25 @@ function stopBot(){
   if(rsTimer){clearTimeout(rsTimer);rsTimer=null;}
   if(!botProc) return {ok:false,msg:"বট চলছে না"};
   try{botProc.kill("SIGTERM");setTimeout(()=>{try{if(botProc)botProc.kill("SIGKILL");}catch{}},5000);}catch{}
-  botProc=null; botStart=null;
+  botProc=null; botStart=null; botFbConnected=false;
   setShouldRun(false);
-  log("🔴 বট বন্ধ করা হয়েছে","warn"); bc({type:"status",running:false});
+  log("🔴 বট বন্ধ করা হয়েছে","warn"); bc({type:"status",running:false,fbConnected:false});
   return {ok:true,msg:"বট বন্ধ হয়েছে"};
 }
+
+// ── WATCHDOG ── প্যানেলে "চালু" দেখালেও Messenger-এ বট আসলে সাড়া দিচ্ছে কিনা তা
+// শুধু প্রসেস জীবিত থাকা দিয়ে বোঝা যায় না — MQTT/heartbeat কার্যকলাপ না এলে ধরে
+// নেওয়া হয় সংযোগ আসলে আটকে গেছে (stale), তখন নিজে থেকেই soft-restart করে
+const WATCHDOG_STALE_MS = 20*60*1000; // ২০ মিনিট কোনো কার্যকলাপ না হলে stale ধরা হবে
+setInterval(()=>{
+  if(!botProc || !lastActivityTs) return;
+  const idleMs = Date.now()-lastActivityTs;
+  if(idleMs > WATCHDOG_STALE_MS){
+    log(`⚠️ Watchdog: বট প্রসেস চলছে কিন্তু ${Math.round(idleMs/60000)} মিনিট ধরে কোনো কার্যকলাপ/heartbeat নেই — সম্ভবত Messenger সংযোগ আটকে গেছে, নিজে থেকেই restart করা হচ্ছে`,"warn");
+    stopBot();
+    setTimeout(()=>startBot("watchdog"),3000);
+  }
+},2*60*1000);
 
 // ── SELF PING ──
 function selfPing(){
@@ -421,13 +473,13 @@ app.get("/"   ,auth,(req,res)=>res.send(mainHTML()));
 app.post("/api/bot/start",   auth,(req,res)=>res.json(startBot()));
 app.post("/api/bot/stop",    auth,(req,res)=>res.json(stopBot()));
 app.post("/api/bot/restart", auth,(req,res)=>{stopBot();setTimeout(()=>res.json(startBot("restart")),2000);});
-app.get("/api/bot/status",   auth,(req,res)=>res.json({running:!!botProc,uptime:botStart?Math.floor((Date.now()-botStart)/1000):0}));
+app.get("/api/bot/status",   auth,(req,res)=>res.json({running:!!botProc,fbConnected:botFbConnected,uptime:botStart?Math.floor((Date.now()-botStart)/1000):0}));
 app.get("/api/bot/logs",     auth,(req,res)=>res.json({logs:botLogs}));
 app.post("/api/bot/clearlogs",auth,(req,res)=>{botLogs=[];bc({type:"clearLogs"});res.json({ok:true});});
 app.post("/api/bot/install", auth,(req,res)=>{
   if(!fs.existsSync(path.join(BDIR,"package.json"))) return res.json({ok:false,msg:"package.json নেই"});
-  try{log("📦 npm install চলছে...","warn");execSync("npm install",{cwd:BDIR,timeout:180000});log("✅ সম্পন্ন","success");res.json({ok:true,msg:"npm install সম্পন্ন"});}
-  catch(e){log("❌ npm install ব্যর্থ: "+e.message,"error");res.json({ok:false,msg:e.message});}
+  const r=npmInstallWithRetry(3);
+  res.json(r.ok?{ok:true,msg:"npm install সম্পন্ন"}:{ok:false,msg:r.msg});
 });
 app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveCfg();res.json({ok:true,enabled:autoRestart});});
 app.get("/api/bot/downloadlog",auth,(req,res)=>{if(fs.existsSync(LFILE))res.download(LFILE,"bot.log");else res.status(404).send("No log");});
@@ -435,7 +487,7 @@ app.post("/api/bot/clearlogfile",auth,(req,res)=>{try{fs.writeFileSync(LFILE,"")
 
 app.get("/api/stats",auth,(req,res)=>{
   function countF(d){let c=0;try{fs.readdirSync(d).forEach(f=>{const s=fs.statSync(path.join(d,f));c+=s.isDirectory()?countF(path.join(d,f)):1;});}catch{}return c;}
-  res.json({...stats,running:!!botProc,currentUptime:botStart?Math.floor((Date.now()-botStart)/1000):0,
+  res.json({...stats,running:!!botProc,fbConnected:botFbConnected,currentUptime:botStart?Math.floor((Date.now()-botStart)/1000):0,
     autoRestart,memMB:Math.round(process.memoryUsage().rss/1024/1024),
     serverUptime:Math.floor(process.uptime()),node:process.version,
     botFiles:countF(BDIR),mongoConnected:db_connected});
@@ -888,7 +940,7 @@ app.post("/api/settings/password",auth,(req,res)=>{
 
 // ── WS ──
 wss.on("connection",ws=>{
-  ws.send(JSON.stringify({type:"status",running:!!botProc}));
+  ws.send(JSON.stringify({type:"status",running:!!botProc,fbConnected:botFbConnected}));
   ws.send(JSON.stringify({type:"logs",data:botLogs}));
   ws.send(JSON.stringify({type:"mongo",connected:db_connected}));
 });
@@ -1448,7 +1500,7 @@ function connectWS(){
     const m=JSON.parse(e.data);
     if(m.type==="log") appendLog(m.data);
     if(m.type==="logs"){document.getElementById("lbox").innerHTML="";m.data.forEach(appendLog);}
-    if(m.type==="status") updateStatus(m.running);
+    if(m.type==="status") updateStatus(m.running,m.fbConnected);
     if(m.type==="clearLogs") document.getElementById("lbox").innerHTML="";
     if(m.type==="mongo") updateMongo(m.connected);
   };
@@ -1471,13 +1523,24 @@ function setLF(f,btn){logFilter=f;document.querySelectorAll(".lf").forEach(b=>b.
 function clearLogs(){fetch("/api/bot/clearlogs",{method:"POST"});}
 function clearLogFile(){if(!confirm("Log file মুছবেন?"))return;fetch("/api/bot/clearlogfile",{method:"POST"}).then(r=>r.json()).then(d=>toast(d.ok?"✅ মুছা হয়েছে":"❌ ব্যর্থ",d.ok?"success":"error"));}
 
-function updateStatus(running){
+function updateStatus(running,fbConnected){
   _botRunning=running;
   if(!running) _botUpSec=0;
   [document.getElementById("sDot"),document.getElementById("tDot")].forEach(d=>{if(d)d.className="dot"+(running?" on":"");});
   const tLogo=document.getElementById("topLogo");if(tLogo)tLogo.className="top-logo"+(running?" live":"");
-  const st=document.getElementById("sTxt");if(st)st.textContent=running?"✅ বট চলছে":"🔴 বট বন্ধ";
-  const ts=document.getElementById("tStatus");if(ts)ts.textContent=running?"✅ চলছে":"🔴 বন্ধ";
+  const st=document.getElementById("sTxt");
+  const ts=document.getElementById("tStatus");
+  if(!running){
+    if(st)st.textContent="🔴 বট বন্ধ";
+    if(ts)ts.textContent="🔴 বন্ধ";
+  } else if(fbConnected){
+    if(st)st.textContent="✅ বট চলছে (Messenger সংযুক্ত)";
+    if(ts)ts.textContent="✅ চলছে";
+  } else {
+    // প্রসেস চালু আছে কিন্তু এখনো Messenger login/heartbeat কনফার্ম হয়নি
+    if(st)st.textContent="⏳ প্রসেস চালু, Messenger সংযোগ যাচাই হচ্ছে...";
+    if(ts)ts.textContent="⏳ যাচাই হচ্ছে";
+  }
 }
 
 function updateMongo(connected){
@@ -1532,7 +1595,7 @@ async function refresh(){
     const cc=document.getElementById("cCrash");if(cc)cc.textContent=st.crashes||0;
     const ct=document.getElementById("cTup");if(ct)ct.textContent=fmtT((st.totalUptime||0)+(bs.uptime||0));
     const cn=document.getElementById("cNode");if(cn)cn.textContent=(st.node||"").replace("v","");
-    updateStatus(bs.running);
+    updateStatus(bs.running,bs.fbConnected);
     updateMongo(st.mongoConnected||false);
     fetch("/api/cookie/status").then(r=>r.json()).then(cs=>{
       const el=document.getElementById("cookieStatus");if(!el)return;
