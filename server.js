@@ -459,6 +459,17 @@ function npmInstallAsync(maxAttempts=3){
 
 function bc(d){wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(JSON.stringify(d));});}
 
+// ── প্যানেল → বট তাৎক্ষণিক IPC নোটিফাই ── নতুন/সম্পাদিত/ডিলিট করা ফাইলের কথা বটকে
+// সাথে সাথে জানানো হয় (fs.watch-এর ৬০০ms ডিবাউন্সের অপেক্ষা ছাড়াই) — বট নিজেই
+// filter করে নেয় শুধু Script/commands/*.js হলে reload করবে
+function notifyBotFile(action, relPath){
+  try{
+    if(botProc && botProc.connected){
+      botProc.send({type:"panel_file_change", action, relPath: relPath.replace(/\\/g,"/")});
+    }
+  }catch(e){/* বট চালু না থাকলে/ipc না থাকলে চুপচাপ স্কিপ — সমস্যা নেই, পরের বার fs.watch ধরে নেবে */}
+}
+
 function log(text,type="info"){
   const e={time:new Date().toLocaleTimeString("bn-BD"),text,type,ts:Date.now()};
   botLogs.push(e); if(botLogs.length>2000) botLogs.shift();
@@ -514,7 +525,10 @@ function startBot(by="manual"){
 
 function launchBotProcess(by, idx){
   if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
-  botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"}});
+  // stdio-তে "ipc" যোগ করা হয়েছে — বটের index.js নিজেই process.on("message") দিয়ে
+  // শোনে, প্যানেল থেকে ফাইল আপলোড/সেভ/ডিলিট হলে সাথে সাথে (fs.watch-এর অপেক্ষা ছাড়াই)
+  // কমান্ড hot-reload করার জন্য এই চ্যানেলটাই মূল, তাৎক্ষণিক পথ
+  botProc=spawn("node",[idx],{cwd:BDIR,env:{...process.env,FORCE_COLOR:"1"},stdio:["ignore","pipe","pipe","ipc"]});
   botStart=Date.now(); stats.starts++; saveJ(SFILE,stats); savePanelStatsToMongo();
   setShouldRun(true);
   botFbConnected=false; lastActivityTs=Date.now();
@@ -751,6 +765,54 @@ function getHeavyStatus(){
     return {active:raw.active, max:raw.max};
   }catch{ return null; }
 }
+
+// ── নেটওয়ার্ক থ্রুপুট (রিয়েল, /proc/net/dev থেকে) — হ্যাকিং-স্টাইল টার্মিনাল ট্যাবের জন্য ──
+let _netPrev=null;
+function readNetBytes(){
+  try{
+    const raw=fs.readFileSync("/proc/net/dev","utf8");
+    let rx=0,tx=0;
+    raw.split("\n").slice(2).forEach(line=>{
+      const m=line.trim().match(/^([\w.]+):\s*(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)/);
+      if(m&&m[1]!=="lo"){rx+=parseInt(m[2],10);tx+=parseInt(m[3],10);}
+    });
+    return {rx,tx,t:Date.now()};
+  }catch{return null;}
+}
+function getNetSpeed(){
+  const now=readNetBytes();
+  if(!now) return {rxKBs:null,txKBs:null};
+  if(!_netPrev){_netPrev=now;return {rxKBs:0,txKBs:0};}
+  const dt=(now.t-_netPrev.t)/1000;
+  const rxKBs=dt>0?Math.max(0,+((now.rx-_netPrev.rx)/1024/dt).toFixed(1)):0;
+  const txKBs=dt>0?Math.max(0,+((now.tx-_netPrev.tx)/1024/dt).toFixed(1)):0;
+  _netPrev=now;
+  return {rxKBs,txKBs};
+}
+let _cpuPrev=null;
+function getCpuPercent(){
+  const usage=process.cpuUsage();
+  const now=Date.now();
+  if(!_cpuPrev){_cpuPrev={usage,t:now};return 0;}
+  const dtMs=now-_cpuPrev.t;
+  const cpuMs=(usage.user-_cpuPrev.usage.user+usage.system-_cpuPrev.usage.system)/1000;
+  _cpuPrev={usage,t:now};
+  if(dtMs<=0) return 0;
+  return Math.min(100,Math.round((cpuMs/dtMs)*100));
+}
+app.get("/api/system/terminal",auth,(req,res)=>{
+  const net=getNetSpeed();
+  const botMB=getBotMemMB(), panelMB=Math.round(process.memoryUsage().rss/1024/1024);
+  res.json({
+    ok:true, time:Date.now(), net,
+    cpuPercent: getCpuPercent(),
+    ramPercent: Math.min(100, Math.round(((botMB||0)+panelMB)/512*100)),
+    botRunning: !!botProc, fbConnected: botFbConnected, heavy: getHeavyStatus(),
+    uptimeSec: botStart?Math.floor((Date.now()-botStart)/1000):0,
+    tail: botLogs.slice(-8).map(l=>({time:l.time,text:l.text,type:l.type}))
+  });
+});
+
 app.get("/api/system/live",auth,async(req,res)=>{
   let mongoStats = null;
   if(db_connected && mongoose && mongoose.connection && mongoose.connection.db){
@@ -904,6 +966,7 @@ app.post("/api/file/save",auth,async(req,res)=>{
     // MongoDB তে সেভ
     const relPath = path.relative(BDIR,f);
     await saveToMongo(relPath, req.body.content||"");
+    notifyBotFile("update", relPath);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -914,6 +977,7 @@ app.post("/api/file/delete",auth,async(req,res)=>{
     const relPath = path.relative(BDIR,f);
     fs.rmSync(f,{recursive:true,force:true});
     await deleteFromMongo(relPath);
+    notifyBotFile("delete", relPath);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -940,6 +1004,8 @@ app.post("/api/file/rename",auth,async(req,res)=>{
     await deleteFromMongo(fromRel);
     if(stat.isDirectory()) await syncDirToMongo(to,toRel);
     else await saveToMongo(toRel,fs.readFileSync(to));
+    notifyBotFile("delete", fromRel);
+    notifyBotFile("update", toRel);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -953,6 +1019,7 @@ app.post("/api/file/newfile",auth,async(req,res)=>{
     fs.writeFileSync(f,content);
     const relPath=path.relative(BDIR,f);
     await saveToMongo(relPath,content);
+    notifyBotFile("update", relPath);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -967,6 +1034,7 @@ app.post("/api/file/copy",auth,async(req,res)=>{
     const toRel=path.relative(BDIR,to);
     if(stat.isDirectory()) await syncDirToMongo(to,toRel);
     else await saveToMongo(toRel,fs.readFileSync(to));
+    notifyBotFile("update", toRel);
     res.json({ok:true});
   }catch(e){res.status(500).json({error:e.message});}
 });
@@ -1050,6 +1118,7 @@ async function processUploadedFile(filePath, originalName, reqPath){
     try{fs.unlinkSync(filePath);}catch{}
     const relPath=path.relative(BDIR,dst);
     const saved=await saveToMongo(relPath,fs.readFileSync(dst));
+    notifyBotFile("update", relPath);
     if(!saved && db_connected){
       log("⚠️ "+originalName+" ডিস্কে সেভ হয়েছে কিন্তু MongoDB তে সেভ ব্যর্থ — Render restart হলে এই ফাইলটা হারিয়ে যাবে","error");
       return {httpStatus:200, body:{ok:false,msg:`⚠️ ${originalName} সাময়িকভাবে ডিস্কে আছে (কমান্ড এখনই কাজ করবে) কিন্তু MongoDB তে সেভ ব্যর্থ হয়েছে — restart হলে হারিয়ে যাবে, আবার আপলোড করো`}};
@@ -1148,6 +1217,7 @@ app.post("/api/file/upload-multi",auth,upload.array("files",50),async(req,res)=>
       try{fs.unlinkSync(file.path);}catch{}
       const relPath=path.relative(BDIR,dst);
       await saveToMongo(relPath,fs.readFileSync(dst));
+      notifyBotFile("update", relPath);
       results.push(file.originalname);
     }
     res.json({ok:true,msg:`✅ ${results.length}টা ফাইল আপলোড হয়েছে`});
@@ -1507,6 +1577,28 @@ textarea.ci:focus{border-color:var(--ac)}
 .srow-p{font-size:11px;color:var(--ac);margin-bottom:2px;font-weight:600}
 .srow-m{font-size:11px;color:var(--mu)}
 .multi-upload-area{border:1px dashed var(--bd);border-radius:12px;padding:16px;background:var(--s2);margin-bottom:12px}
+
+/* ── TERMINAL (হ্যাকার-স্টাইল) ── */
+.term-box{background:#020a02;border:1px solid #0f3d0f;border-radius:10px;padding:14px;font-family:'Courier New',monospace;font-size:12px;color:#4dff4d;min-height:70vh;max-height:78vh;overflow-y:auto;box-shadow:inset 0 0 30px rgba(0,255,0,.06)}
+.term-line{margin-bottom:4px;white-space:pre-wrap;word-break:break-all;text-shadow:0 0 4px rgba(77,255,77,.4)}
+.term-line.warn{color:#ffd24d;text-shadow:0 0 4px rgba(255,210,77,.4)}
+.term-line.error{color:#ff5c5c;text-shadow:0 0 4px rgba(255,92,92,.4)}
+.term-line.head{color:#7cf9ff;text-shadow:0 0 4px rgba(124,249,255,.4)}
+.term-bar{display:flex;justify-content:space-between;margin-bottom:2px}
+.term-gauge{display:inline-block;width:80px;background:#0a1f0a;border-radius:4px;overflow:hidden;height:8px;vertical-align:middle;margin:0 4px}
+.term-gauge i{display:block;height:100%;background:#4dff4d}
+
+/* ── COMMAND TEST ── */
+.test-wrap{padding:2px}
+.test-row{display:flex;gap:8px}
+.test-row input{flex:1;background:var(--s2);border:1px solid var(--bd);border-radius:9px;padding:10px 12px;color:var(--tx);font-size:13px}
+.test-code{width:100%;min-height:160px;margin-top:10px;background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;color:var(--tx);font-family:'Courier New',monospace;font-size:12px;resize:vertical}
+.test-result{margin-top:12px}
+.test-card{background:var(--s2);border:1px solid var(--bd);border-left:4px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:8px;font-size:12px}
+.test-card.ok{border-left-color:var(--gr)}
+.test-card.fail{border-left-color:var(--rd)}
+.test-card-title{font-weight:800;margin-bottom:4px}
+.test-api-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--bd);font-size:11px}
 </style></head><body>
 
 <div class="top">
@@ -1670,6 +1762,27 @@ textarea.ci:focus{border-color:var(--ac)}
   <div class="lbox" id="lbox"></div>
 </div>
 
+<!-- TERMINAL -->
+<div id="pg-term" class="page">
+  <div class="term-box" id="termBox">
+    <div class="term-line">Bot Panel Terminal — লাইভ সিস্টেম মনিটর</div>
+    <div class="term-line">সংযোগ করা হচ্ছে...</div>
+  </div>
+</div>
+
+<!-- COMMAND TEST -->
+<div id="pg-test" class="page">
+  <div class="test-wrap">
+    <div class="test-row">
+      <input type="text" id="testPath" placeholder="যেমনঃ Script/commands/mycommand.js">
+      <button class="tbtn p" onclick="testFile()">🧪 টেস্ট করো</button>
+    </div>
+    <div style="font-size:11px;color:var(--mu);margin:6px 2px 10px">উপরে existing ফাইলের path দাও, অথবা নিচে নতুন/সংশোধিত কোড পেস্ট করে "টেস্ট করো" চাপলে সেভ + টেস্ট দুটোই একসাথে হবে</div>
+    <textarea id="testCode" class="test-code" placeholder="কমান্ড ফাইলের কোড এখানে পেস্ট করো (ঐচ্ছিক — খালি রাখলে উপরের path-এর ফাইলটাই টেস্ট হবে)"></textarea>
+    <div id="testResult" class="test-result"></div>
+  </div>
+</div>
+
 <!-- FILES -->
 <div id="pg-files" class="page">
   <div id="edView" style="display:none">
@@ -1804,6 +1917,8 @@ textarea.ci:focus{border-color:var(--ac)}
   <button class="tab active" onclick="goTab('home',this)"><span class="ti">🏠</span><span class="tl">হোম</span></button>
   <button class="tab" onclick="goTab('monitor',this)"><span class="ti">📊</span><span class="tl">মনিটর</span></button>
   <button class="tab" onclick="goTab('logs',this)"><span class="ti">📋</span><span class="tl">লগ</span></button>
+  <button class="tab" onclick="goTab('term',this)"><span class="ti">🖥️</span><span class="tl">টার্মিনাল</span></button>
+  <button class="tab" onclick="goTab('test',this)"><span class="ti">🧪</span><span class="tl">টেস্ট</span></button>
   <button class="tab" onclick="goTab('files',this)"><span class="ti">📁</span><span class="tl">ফাইল</span></button>
   <button class="tab" onclick="goTab('upload',this)"><span class="ti">⬆️</span><span class="tl">আপলোড</span></button>
   <button class="tab" onclick="goTab('more',this)"><span class="ti">⚙️</span><span class="tl">আরো</span></button>
@@ -1827,12 +1942,15 @@ function goTab(id,btn){
   btn.classList.add("active");
   document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
   document.getElementById("pg-"+id).classList.add("active");
+  if(id!=="term" && _termTimer){ clearInterval(_termTimer); _termTimer=null; }
   if(id==="files") loadFiles(curDir);
   if(id==="more"){loadEnv();loadSettings();}
   if(id==="logs") document.getElementById("lbox").scrollTop=document.getElementById("lbox").scrollHeight;
   if(id==="upload"){document.getElementById("uploadDir").textContent=curDir||"root";}
   if(id==="monitor") loadMonitor();
+  if(id==="term"){ loadTerminal(); _termTimer=setInterval(loadTerminal,1500); }
 }
+let _termTimer=null;
 
 // WS
 function connectWS(){
@@ -2000,6 +2118,69 @@ async function refresh(){
 
 // LIVE MONITOR
 function _mColor(pct){ return pct<60?"var(--gr)":pct<85?"var(--yw)":"var(--rd)"; }
+async function loadTerminal(){
+  try{
+    const d=await fetch("/api/system/terminal").then(r=>r.json());
+    const box=document.getElementById("termBox");
+    const now=new Date().toLocaleTimeString("bn-BD");
+    const gauge=(pct)=>'<span class="term-gauge"><i style="width:'+Math.min(100,pct||0)+'%;background:'+(pct>85?"#ff5c5c":pct>60?"#ffd24d":"#4dff4d")+'"></i></span>'+Math.round(pct||0)+'%';
+    let html='';
+    html+='<div class="term-line head">┌─[belal@bot-panel]─['+now+']</div>';
+    html+='<div class="term-line">│ বট স্ট্যাটাস : '+(d.botRunning?(d.fbConnected?"🟢 RUNNING (Messenger সংযুক্ত)":"🟡 RUNNING (সংযোগ যাচাই হচ্ছে)"):"🔴 STOPPED")+'</div>';
+    html+='<div class="term-line">│ Uptime      : '+fmtT(d.uptimeSec||0)+'</div>';
+    html+='<div class="term-line">│ CPU         : '+gauge(d.cpuPercent)+'</div>';
+    html+='<div class="term-line">│ RAM (512MB) : '+gauge(d.ramPercent)+'</div>';
+    html+='<div class="term-line">│ NET ↓'+(d.net?.rxKBs??"--")+'KB/s  ↑'+(d.net?.txKBs??"--")+'KB/s</div>';
+    if(d.heavy?.active) html+='<div class="term-line warn">│ ⚠ ভারী টাস্ক চলছে: '+d.heavy.active+' (max '+d.heavy.max+')</div>';
+    html+='<div class="term-line head">└──────────────────────────────</div>';
+    html+='<div class="term-line">$ tail -f panel.log</div>';
+    (d.tail||[]).forEach(l=>{
+      const cls=l.type==="error"?"error":l.type==="warn"?"warn":"";
+      html+='<div class="term-line '+cls+'">['+l.time+'] '+esc(l.text)+'</div>';
+    });
+    const wasAtBottom = box.scrollTop+box.clientHeight >= box.scrollHeight-20;
+    box.innerHTML=html;
+    if(wasAtBottom) box.scrollTop=box.scrollHeight;
+  }catch(e){/* সাময়িক নেটওয়ার্ক গ্যাপ — পরের পোলে ঠিক হয়ে যাবে */}
+}
+
+async function testFile(pathOverride){
+  const pathInput=document.getElementById("testPath");
+  if(pathOverride) pathInput.value=pathOverride;
+  const p=pathInput.value.trim();
+  const code=document.getElementById("testCode").value;
+  const resBox=document.getElementById("testResult");
+  if(!p){ toast("❌ আগে ফাইলের path দাও","error"); return; }
+  resBox.innerHTML='<div class="test-card">⏳ টেস্ট চলছে...</div>';
+  try{
+    if(code.trim()){
+      await fetch("/api/file/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:p,content:code})});
+    }
+    const d=await fetch("/api/file/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:p})}).then(r=>r.json());
+    if(!d.ok){ resBox.innerHTML='<div class="test-card fail"><div class="test-card-title">❌ ব্যর্থ</div>'+esc(d.msg||d.error||"অজানা সমস্যা")+'</div>'; return; }
+    const r=d.result;
+    let html='';
+    html+='<div class="test-card '+(r.syntax?.ok?"ok":"fail")+'"><div class="test-card-title">'+(r.syntax?.ok?"✅":"❌")+' সিনট্যাক্স</div>'+esc(r.syntax?.msg||"")+'</div>';
+    if(r.structure) html+='<div class="test-card '+(r.structure.ok?"ok":"fail")+'"><div class="test-card-title">'+(r.structure.ok?"✅":"❌")+' স্ট্রাকচার</div>'+esc(r.structure.msg||"")+'</div>';
+    if(r.dependencies?.length){
+      html+='<div class="test-card"><div class="test-card-title">📦 Dependencies</div>'+r.dependencies.map(x=>'<div class="test-api-row"><span>'+esc(x.pkg)+'</span><span>'+(x.ok?"✅ ইনস্টল আছে":"❌ নেই")+'</span></div>').join("")+'</div>';
+    }
+    if(r.apis?.length){
+      html+='<div class="test-card"><div class="test-card-title">🌐 API লিংক টেস্ট</div>'+r.apis.map(x=>'<div class="test-api-row"><span style="word-break:break-all">'+esc(x.url)+'</span><span>'+(x.ok?"✅ "+x.status:"❌ "+x.status)+'</span></div>').join("")+'</div>';
+    }
+    resBox.innerHTML=html;
+    toast(r.syntax?.ok&&(!r.structure||r.structure.ok)?"✅ টেস্ট সম্পন্ন":"⚠️ সমস্যা পাওয়া গেছে",r.syntax?.ok?"success":"warn");
+  }catch(e){ resBox.innerHTML='<div class="test-card fail">❌ টেস্ট চালাতে ব্যর্থ: '+esc(e.message)+'</div>'; }
+}
+function quickTest(fp){ 
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
+  document.getElementById("pg-test").classList.add("active");
+  [...document.querySelectorAll(".tab")].find(b=>b.getAttribute("onclick")?.includes("'test'"))?.classList.add("active");
+  document.getElementById("testCode").value="";
+  testFile(fp);
+}
+
 async function loadMonitor(){
   try{
     const d=await fetch("/api/system/live").then(r=>r.json());
@@ -2132,6 +2313,7 @@ async function loadFiles(dir){
       +'<div class="fn"><div class="fn-name">'+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?' · <span data-mtime="'+item.mtime+'">'+fdt(item.mtime)+'</span>':"")+'</div></div>'
       +'<div class="fa">'
       +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
+      +(!item.isDir && /\.js$/i.test(item.name)?'<button class="fab" onclick="event.stopPropagation();quickTest(\\''+fp+'\\')">🧪</button>':'')
       +'<button class="fab" onclick="event.stopPropagation();dlF(\\''+fp+'\\')">⬇️</button>'
       +'<button class="fab" onclick="event.stopPropagation();showRename(\\''+fp+'\\',\\''+item.name+'\\')">🔤</button>'
       +'<button class="fab" onclick="event.stopPropagation();showCopy(\\''+fp+'\\')">📋</button>'
