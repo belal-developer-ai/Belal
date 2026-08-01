@@ -417,12 +417,29 @@ function npmInstallAsync(maxAttempts=3){
       log(`📦 npm ${npmArgs[0]} চলছে (ব্যাকগ্রাউন্ডে, প্যানেল সচল থাকবে, RAM: ${ramBefore}MB)... (চেষ্টা ${attempt}/${maxAttempts})`,"warn");
       const p=spawn("npm",npmArgs,{cwd:BDIR});
       let errBuf="";
+      let settled=false;
       // প্রতি মিনিটে "এখনো চলছে" আপডেট — যাতে বোঝা যায় আটকে যায়নি, নাকি স্বাভাবিক ধীরগতি
       const startedAt=Date.now();
       const heartbeat=setInterval(()=>{
         const mins=Math.round((Date.now()-startedAt)/60000);
         log(`⏳ npm install এখনো চলছে (${mins} মিনিট পার হয়েছে)...`,"info");
       },60*1000);
+      // ── প্রকৃত নেটওয়ার্ক-স্টল সনাক্তকরণ ──
+      // শুধু সময় গোনা যথেষ্ট না — npm registry-র সাথে connection সত্যিই আটকে গেলে
+      // (ডাউনলোড স্পিড প্রায় শূন্য) ২০ মিনিট অপেক্ষা করানো অন্যায্য। তাই প্রতি ৩০
+      // সেকেন্ডে real throughput চেক করা হয়, টানা ২ মিনিট প্রায়-শূন্য থাকলে
+      // (স্বাভাবিক ধীরগতি না, সত্যিকারের আটকে যাওয়া) সাথে সাথে বাতিল করে রিট্রাই
+      let lowSpeedStreak=0;
+      const stallCheck=setInterval(()=>{
+        const {rxKBs}=getNetSpeed();
+        if(rxKBs!=null && rxKBs<2){
+          lowSpeedStreak++;
+          if(lowSpeedStreak>=4){ // ৪ × ৩০সে = ২ মিনিট প্রায়-শূন্য গতি
+            log("🛑 নেটওয়ার্ক স্টল সনাক্ত — ২ মিনিট ধরে ডাউনলোড স্পিড প্রায় শূন্য (registry সংযোগ আটকে গেছে), ২০ মিনিট অপেক্ষা না করে এখনই বাতিল করে রিট্রাই করা হচ্ছে","error");
+            try{p.kill("SIGKILL");}catch{}
+          }
+        } else lowSpeedStreak=0;
+      },30*1000);
       // নিরাপত্তা: ২০ মিনিটেও শেষ না হলে (native কম্পাইল স্লো হতে পারে) চিরস্থায়ী আটকে
       // থাকা এড়াতে জোর করে বন্ধ করে দেওয়া হবে
       const killT=setTimeout(()=>{
@@ -431,7 +448,7 @@ function npmInstallAsync(maxAttempts=3){
       },20*60*1000);
       p.stderr.on("data",d=>{errBuf+=d.toString();});
       p.on("exit",code=>{
-        clearTimeout(killT); clearInterval(heartbeat);
+        clearTimeout(killT); clearInterval(heartbeat); clearInterval(stallCheck);
         const ramAfter=Math.round(process.memoryUsage().rss/1024/1024);
         if(code===0){
           log(`✅ npm install সম্পন্ন (RAM এখন: ${ramAfter}MB)`,"success");
@@ -448,7 +465,7 @@ function npmInstallAsync(maxAttempts=3){
         }
       });
       p.on("error",e=>{
-        clearTimeout(killT); clearInterval(heartbeat);
+        clearTimeout(killT); clearInterval(heartbeat); clearInterval(stallCheck);
         if(attempt<maxAttempts) setTimeout(tryOnce,5000*attempt);
         else { npmInstalling=false; resolve({ok:false,msg:e.message}); }
       });
