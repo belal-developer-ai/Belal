@@ -722,6 +722,38 @@ app.post("/api/bot/restart", auth,(req,res)=>{stopBot();setTimeout(()=>res.json(
 app.get("/api/bot/status",   auth,(req,res)=>res.json({running:!!botProc,fbConnected:botFbConnected,uptime:botStart?Math.floor((Date.now()-botStart)/1000):0}));
 app.get("/api/bot/logs",     auth,(req,res)=>res.json({logs:botLogs}));
 app.post("/api/bot/clearlogs",auth,(req,res)=>{botLogs=[];bc({type:"clearLogs"});res.json({ok:true});});
+// ── package.json এক-চাপে ঠিক করা ── মোবাইলে কপি-পেস্ট করে ভুল JSON সেভ হয়ে
+// বট বুটই করতে না পারার সমস্যা বারবার হচ্ছিল — তাই সার্ভার-সাইড থেকেই সরাসরি
+// একটা গ্যারান্টিড-ভ্যালিড package.json লিখে দেওয়ার বাটন
+const KNOWN_GOOD_PACKAGE = {
+  name: "belal-botx666-max", version: "8.0.0", main: "index.js",
+  scripts: { start: "node index.js" },
+  dependencies: {
+    "fca-unofficial": "latest", "fs-extra": "^11.2.0", "chalk": "^4.1.2",
+    "moment-timezone": "^0.5.45", "axios": "^1.7.7", "express": "^4.19.2",
+    "sequelize": "^6.37.3", "better-sqlite3": "^11.3.0", "form-data": "^4.0.0",
+    "string-similarity": "^4.0.4", "node-schedule": "^2.1.1", "jimp": "^0.22.12",
+    "canvas": "^2.11.2", "fluent-ffmpeg": "^2.1.3"
+  }
+};
+app.post("/api/bot/fix-package",auth,async(req,res)=>{
+  try{
+    const f=path.join(BDIR,"package.json");
+    let merged=KNOWN_GOOD_PACKAGE;
+    // বর্তমান ফাইলটা যদি (আংশিক ভাঙা হলেও) valid হয়, তার নাম/অতিরিক্ত dependency
+    // যতটা সম্ভব রক্ষা করার চেষ্টা করা হচ্ছে, নাহলে known-good বেসলাইন দিয়ে বদলে দেওয়া হয়
+    try{
+      const existing=JSON.parse(fs.readFileSync(f,"utf8"));
+      merged={...KNOWN_GOOD_PACKAGE, ...existing, dependencies:{...KNOWN_GOOD_PACKAGE.dependencies, ...(existing.dependencies||{})}};
+    }catch{ log("⚠️ package.json আগের থেকে পড়া যায়নি (invalid ছিল) — নতুন করে বসানো হচ্ছে","warn"); }
+    const content=JSON.stringify(merged,null,2);
+    fs.writeFileSync(f,content);
+    await saveToMongo("package.json",content);
+    log("🔧 package.json এক-চাপে ঠিক করা হলো — এখন valid JSON","success");
+    res.json({ok:true,msg:"✅ package.json ঠিক করা হয়েছে — এখন npm install/বট চালু করো"});
+  }catch(e){res.status(500).json({ok:false,msg:e.message});}
+});
+
 app.post("/api/bot/install", auth,async(req,res)=>{
   if(!fs.existsSync(path.join(BDIR,"package.json"))) return res.json({ok:false,msg:"package.json নেই"});
   if(npmInstalling) return res.json({ok:false,msg:"npm install ইতিমধ্যে চলছে, লগ দেখো"});
@@ -974,6 +1006,14 @@ app.post("/api/file/test",auth,async(req,res)=>{
 app.post("/api/file/save",auth,async(req,res)=>{
   try{
     const f=safe(BDIR,req.body.path);
+    // .json ফাইল হলে সেভ করার আগেই সিনট্যাক্স যাচাই — ভুল JSON সেভ হয়ে
+    // package.json/config ভেঙে বট বুট হতে না পারার সমস্যা এখানেই আটকে দেওয়া হচ্ছে
+    if(/\.json$/i.test(f)){
+      try{ JSON.parse(req.body.content||""); }
+      catch(e){
+        return res.status(400).json({ok:false,error:"❌ Invalid JSON — সেভ করা হয়নি: "+e.message+" — পুরো ফাইলটা { দিয়ে শুরু আর } দিয়ে শেষ হচ্ছে কিনা, প্রতিটা লাইনের শেষে কমা ঠিক আছে কিনা দেখো"});
+      }
+    }
     fs.mkdirSync(path.dirname(f),{recursive:true});
     fs.writeFileSync(f,req.body.content||"");
     // MongoDB তে সেভ
@@ -1682,6 +1722,9 @@ textarea.ci:focus{border-color:var(--ac)}
       <button class="btn b-green" onclick="mongoSync()">☁️ MongoDB Sync</button>
       <button class="btn b-ghost" onclick="mongoRestore()">🔄 Restore</button>
     </div>
+    <div class="bg2" style="margin-top:8px">
+      <button class="btn b-ghost" onclick="fixPackage()">🔧 package.json ঠিক করো</button>
+    </div>
     <div class="tog-row">
       <div><div style="font-size:13px;font-weight:600">Auto Restart</div><div style="font-size:10px;color:var(--mu);margin-top:2px">Crash হলে অটো চালু</div></div>
       <label class="tog"><input type="checkbox" id="arTog" onchange="toggleAR(this.checked)"><div class="tog-bg"></div><div class="tog-dot"></div></label>
@@ -2273,6 +2316,12 @@ async function botAct(a){
   setTimeout(refresh,2500);
 }
 async function npmInst(){toast("📦 npm install শুরু...","warn");const d=await fetch("/api/bot/install",{method:"POST"}).then(r=>r.json());toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");}
+async function fixPackage(){
+  if(!confirm("package.json এখন সার্ভার থেকে একটা valid, নিরাপদ ভার্সন দিয়ে ঠিক করা হবে (আগের valid dependency গুলো যতটা সম্ভব রাখা হবে)। এগিয়ে যাবে?")) return;
+  toast("🔧 package.json ঠিক করা হচ্ছে...","warn");
+  const d=await fetch("/api/bot/fix-package",{method:"POST"}).then(r=>r.json());
+  toast(d.ok?"✅ "+d.msg:"❌ "+d.msg,d.ok?"success":"error");
+}
 function doBackup(){window.open("/api/backup");}
 async function toggleAR(v){
   await fetch("/api/bot/autorestart",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:v})});
