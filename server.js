@@ -499,22 +499,41 @@ async function getShouldRun(){
   }catch{return false;}
 }
 
+// ── node_modules "স্টেইল/সেকেলে" কিনা যাচাই ──
+// আগে শুধু node_modules ফোল্ডার আছে কিনা দেখেই ধরে নেওয়া হতো সব ঠিক আছে —
+// কিন্তু package.json পরে পরিবর্তন হলে (নতুন dependency যোগ) পুরনো node_modules
+// দিয়েই বট চালু হয়ে যেত, আর bot নিজের bootstrap দিয়ে ধীরে/বারবার ইনস্টল করতে
+// বাধ্য হতো। এখন package.json-এর hash-ভিত্তিক মার্কার দিয়ে আসল অবস্থা যাচাই হয়।
+function nmHashMarkerPath(){ return path.join(BDIR,".nm_hash"); }
+function nodeModulesIsStale(){
+  const nmDir=path.join(BDIR,"node_modules");
+  if(!fs.existsSync(nmDir)) return true;
+  const curHash=botPackageHash();
+  if(!curHash) return false; // package.json ই নেই — এখানে কিছু করার নেই, launch যা আছে তাই দিয়ে চেষ্টা করবে
+  try{
+    const saved=fs.readFileSync(nmHashMarkerPath(),"utf8").trim();
+    return saved!==curHash;
+  }catch{ return true; } // মার্কার নেই মানে আগে কখনো hash রেকর্ড হয়নি — নিরাপদ থাকতে reinstall
+}
+function markNodeModulesFresh(){
+  try{ const h=botPackageHash(); if(h) fs.writeFileSync(nmHashMarkerPath(),h); }catch{}
+}
+
 function startBot(by="manual"){
   if(botProc) return {ok:false,msg:"বট ইতিমধ্যে চলছে"};
   if(npmInstalling) return {ok:false,msg:"npm install ইতিমধ্যে ব্যাকগ্রাউন্ডে চলছে, শেষ হলে বট নিজে থেকেই চালু হবে"};
   const idx=["index.js","app.js","main.js","bot.js","start.js"].find(f=>fs.existsSync(path.join(BDIR,f)));
   if(!idx) return {ok:false,msg:"index.js পাওয়া যায়নি — বট আপলোড করুন"};
-  const nmDir=path.join(BDIR,"node_modules");
-  if(!fs.existsSync(nmDir)){
-    log("🔎 বটের node_modules নেই — আগে MongoDB ক্যাশ চেক করা হচ্ছে...","info");
+  if(nodeModulesIsStale()){
+    log("🔎 package.json পরিবর্তন হয়েছে বা node_modules নেই — আগে MongoDB ক্যাশ চেক করা হচ্ছে...","info");
     npmInstalling=true;
     (async()=>{
       const restored=await tryRestoreNodeModulesCache().catch(()=>false);
       npmInstalling=false;
-      if(restored){ launchBotProcess(by, idx); return; }
+      if(restored){ markNodeModulesFresh(); launchBotProcess(by, idx); return; }
       log("📦 ক্যাশ পাওয়া যায়নি — npm install ব্যাকগ্রাউন্ডে শুরু হচ্ছে, শেষ হলে বট automatically চালু হবে","warn");
       npmInstallAsync(3).then(r=>{
-        if(r.ok) launchBotProcess(by, idx);
+        if(r.ok){ markNodeModulesFresh(); launchBotProcess(by, idx); }
         else log("❌ npm install বারবার ব্যর্থ হওয়ায় বট চালু করা যায়নি — নেটওয়ার্ক ঠিক হলে 'Start' আবার চাপো","error");
       });
     })();
@@ -758,6 +777,7 @@ app.post("/api/bot/install", auth,async(req,res)=>{
   if(!fs.existsSync(path.join(BDIR,"package.json"))) return res.json({ok:false,msg:"package.json নেই"});
   if(npmInstalling) return res.json({ok:false,msg:"npm install ইতিমধ্যে চলছে, লগ দেখো"});
   const r=await npmInstallAsync(3);
+  if(r.ok) markNodeModulesFresh();
   res.json(r.ok?{ok:true,msg:"npm install সম্পন্ন"}:{ok:false,msg:r.msg});
 });
 app.post("/api/bot/autorestart",auth,(req,res)=>{autoRestart=!!req.body.enabled;cfg.autoRestart=autoRestart;saveCfg();res.json({ok:true,enabled:autoRestart});});
