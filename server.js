@@ -308,7 +308,7 @@ const auth = (req,res,next) => req.session.ok ? next() : res.redirect("/login");
 const safe = (base,rel) => { const f=path.resolve(base,rel||""); if(!f.startsWith(path.resolve(base))) throw new Error("Access denied"); return f; };
 
 // ── BOT ──
-let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null, _consecutiveCrashes=0;
+let botProc=null, botLogs=[], botStart=null, autoRestart=cfg.autoRestart||false, rsTimer=null, _consecutiveCrashes=0, _crashTimestamps=[];
 let botFbConnected=false, lastActivityTs=null, watchdogTimer=null, npmInstalling=false;
 
 // ── npm install (নন-ব্লকিং, ব্যাকঅফ রিট্রাই + node_modules ক্যাশ সহ) ──
@@ -569,6 +569,19 @@ function launchBotProcess(by, idx){
     log(`🔴 বট বন্ধ (code:${code||sig}, uptime:${fmtS(up)})`,"error");
     botProc=null; botStart=null; botFbConnected=false; bc({type:"status",running:false,fbConnected:false});
     if(autoRestart&&code!==0&&code!==null){
+      // ── ক্র্যাশ-লুপ ব্রেকার ── কোনো কারণে বট বারবার ক্র্যাশ করেই যাচ্ছে (যেমন: একটা
+      // dependency install ব্যর্থ হয়েই যাচ্ছে, বা কোনো কোড bug যেটা প্রতিবার বুট হতেই
+      // exit করিয়ে দেয়) — এমন ক্ষেত্রে অসীম restart লুপে না গিয়ে ৩০ মিনিটে ৪ বারের বেশি
+      // ক্র্যাশ হলে auto-restart সাময়িকভাবে বন্ধ করে জোরালোভাবে সতর্ক করা হয়, যাতে
+      // বৃথা রিসোর্স/মেমরি নষ্ট না হয় আর সমস্যাটা স্পষ্টভাবে চোখে পড়ে
+      _crashTimestamps.push(Date.now());
+      _crashTimestamps=_crashTimestamps.filter(t=>Date.now()-t < 30*60*1000);
+      if(_crashTimestamps.length>=4){
+        notify("error","🛑 ক্র্যাশ-লুপ সনাক্ত হয়েছে — Auto-restart বন্ধ","৩০ মিনিটে ৪+ বার ক্র্যাশ করেছে — এটা কোনো ক্ষণস্থায়ী সমস্যা নয়, বারবার একই কারণে ক্র্যাশ করছে (dependency/কোড সমস্যা)। Auto-restart বন্ধ করা হলো — লগ/টার্মিনাল ট্যাব দেখে আসল কারণ ঠিক করে ম্যানুয়ালি 'চালু' চাপো।");
+        log("🛑 ক্র্যাশ-লুপ সনাক্ত — Auto-restart বন্ধ করা হলো (ম্যানুয়ালি চালু করতে হবে)","error");
+        _crashTimestamps=[];
+        return;
+      }
       // ── উঠতি-ধাপে অপেক্ষা (exponential backoff) ──
       // দ্রুত/বারবার ক্র্যাশ হলে (বিশেষত ফেসবুকের 429 rate-limit) প্রতিবার
       // অপেক্ষার সময় বাড়বে, যাতে ফেসবুককে বারবার বিরক্ত করে ব্লক আরও
@@ -1799,6 +1812,7 @@ textarea.ci:focus{border-color:var(--ac)}
     <div class="pathbar" id="pathBar">📁 root</div>
     <div class="fm-acts">
       <button class="tbtn p" onclick="showM('mkdir')">📁+</button>
+      <button class="tbtn p" onclick="goUploadHere()">⬆️ আপলোড</button>
       <button class="tbtn p" onclick="showM('newfile')">📄+</button>
       <button class="tbtn" onclick="loadFiles(curDir)">🔄</button>
       <button class="tbtn" onclick="editF('package.json')">📋 pkg</button>
@@ -1813,6 +1827,7 @@ textarea.ci:focus{border-color:var(--ac)}
 
 <!-- UPLOAD -->
 <div id="pg-upload" class="page">
+  <button class="tbtn" onclick="goTab('files',[...document.querySelectorAll('.tab')].find(b=>b.getAttribute('onclick')?.includes(\"'files'\")))" style="margin-bottom:10px">← ফাইল ম্যানেজারে ফিরে</button>
   <div class="pg-title">⬆️ আপলোড</div>
 
   <!-- ZIP UPLOAD -->
@@ -1920,7 +1935,6 @@ textarea.ci:focus{border-color:var(--ac)}
   <button class="tab" onclick="goTab('term',this)"><span class="ti">🖥️</span><span class="tl">টার্মিনাল</span></button>
   <button class="tab" onclick="goTab('test',this)"><span class="ti">🧪</span><span class="tl">টেস্ট</span></button>
   <button class="tab" onclick="goTab('files',this)"><span class="ti">📁</span><span class="tl">ফাইল</span></button>
-  <button class="tab" onclick="goTab('upload',this)"><span class="ti">⬆️</span><span class="tl">আপলোড</span></button>
   <button class="tab" onclick="goTab('more',this)"><span class="ti">⚙️</span><span class="tl">আরো</span></button>
 </div>
 
@@ -1951,6 +1965,12 @@ function goTab(id,btn){
   if(id==="term"){ loadTerminal(); _termTimer=setInterval(loadTerminal,1500); }
 }
 let _termTimer=null;
+function goUploadHere(){
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
+  document.getElementById("pg-upload").classList.add("active");
+  document.getElementById("uploadDir").textContent=curDir||"root";
+}
 
 // WS
 function connectWS(){
@@ -2280,6 +2300,16 @@ function ficon(name,isDir){
   return{js:"📜",mjs:"📜",cjs:"📜",json:"📋",md:"📝",txt:"📄",env:"🔐",log:"📋",jpg:"🖼",jpeg:"🖼",png:"🖼",gif:"🖼",webp:"🖼",mp3:"🎵",mp4:"🎬",zip:"📦",tar:"📦",gz:"📦",html:"🌐",css:"🎨",ts:"📘",py:"🐍",sh:"⚡",bat:"⚡",yml:"⚙️",yaml:"⚙️",xml:"📋",lock:"🔒",gitignore:"👁️",npmrc:"⚙️",babelrc:"⚙️"}[e]||"📄";
 }
 function langExt(n){const e=n.split(".").pop().toLowerCase();return{js:"JavaScript",json:"JSON",md:"Markdown",html:"HTML",css:"CSS",py:"Python",ts:"TypeScript",sh:"Shell",env:"ENV",txt:"Text",yml:"YAML",xml:"XML"}[e]||e.toUpperCase();}
+// GitHub-স্টাইল ভাষা-রঙ ডট — .js ফাইল দিলেই হলুদ ডট নিয়ে রঙিন হয়ে ফুটে ওঠে
+function langColor(name){
+  const e=name.split(".").pop().toLowerCase();
+  return {js:"#f1e05a",mjs:"#f1e05a",cjs:"#f1e05a",json:"#8bc34a",md:"#5fb4e8",html:"#e34c26",css:"#563d7c",ts:"#3178c6",py:"#3572A5",sh:"#89e051",env:"#ffb347",yml:"#cb171e",yaml:"#cb171e",lock:"#999"}[e]||null;
+}
+function langDot(name,isDir){
+  if(isDir) return "";
+  const c=langColor(name);
+  return c?'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+c+';margin-right:6px;box-shadow:0 0 4px '+c+'"></span>':"";
+}
 
 function buildPath(dir){
   const bar=document.getElementById("pathBar");
@@ -2310,7 +2340,7 @@ async function loadFiles(dir){
     const fp=curDir?curDir+"/"+item.name:item.name;
     const row=document.createElement("div");row.className="frow";
     row.innerHTML='<span class="fi">'+ficon(item.name,item.isDir)+'</span>'
-      +'<div class="fn"><div class="fn-name">'+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?' · <span data-mtime="'+item.mtime+'">'+fdt(item.mtime)+'</span>':"")+'</div></div>'
+      +'<div class="fn"><div class="fn-name">'+langDot(item.name,item.isDir)+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?' · <span data-mtime="'+item.mtime+'">'+fdt(item.mtime)+'</span>':"")+'</div></div>'
       +'<div class="fa">'
       +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
       +(!item.isDir && /\.js$/i.test(item.name)?'<button class="fab" onclick="event.stopPropagation();quickTest(\\''+fp+'\\')">🧪</button>':'')
