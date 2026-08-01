@@ -775,7 +775,7 @@ const KNOWN_GOOD_PACKAGE = {
   dependencies: {
     "fca-unofficial": "latest", "fs-extra": "^11.2.0", "chalk": "^4.1.2",
     "moment-timezone": "^0.5.45", "axios": "^1.7.7", "express": "^4.19.2",
-    "sequelize": "^6.37.3", "better-sqlite3": "^11.3.0", "form-data": "^4.0.0",
+    "sequelize": "^6.37.3", "sqlite3": "^5.1.7", "better-sqlite3": "^11.3.0", "form-data": "^4.0.0",
     "string-similarity": "^4.0.4", "node-schedule": "^2.1.1", "jimp": "^0.22.12",
     "canvas": "^2.11.2", "fluent-ffmpeg": "^2.1.3"
   }
