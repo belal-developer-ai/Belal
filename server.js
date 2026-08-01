@@ -519,18 +519,26 @@ async function getShouldRun(){
 // ── node_modules "স্টেইল/সেকেলে" কিনা যাচাই ──
 // আগে শুধু node_modules ফোল্ডার আছে কিনা দেখেই ধরে নেওয়া হতো সব ঠিক আছে —
 // কিন্তু package.json পরে পরিবর্তন হলে (নতুন dependency যোগ) পুরনো node_modules
-// দিয়েই বট চালু হয়ে যেত, আর bot নিজের bootstrap দিয়ে ধীরে/বারবার ইনস্টল করতে
-// বাধ্য হতো। এখন package.json-এর hash-ভিত্তিক মার্কার দিয়ে আসল অবস্থা যাচাই হয়।
+// দিয়েই বট চালু হয়ে যেত। প্রথমে শুধু hash-marker ফাইল দিয়ে চেক করা হতো, কিন্তু
+// Render-এর Build Command দিয়ে (bot/-এর ভিতরে সরাসরি npm install) ইনস্টল হলে
+// এই marker ফাইলটা লেখাই হতো না (কারণ সেটা শুধু panel নিজের install ফাংশন লেখে) —
+// ফলে node_modules আসলে ঠিকই থাকলেও প্যানেল সেটা বুঝতে না পেরে অযথা আবার ইনস্টল
+// করতে যেত। এখন সরাসরি package.json-এর প্রতিটা dependency ফোল্ডার বাস্তবে আছে
+// কিনা যাচাই করা হয় — এটা কীভাবে ইনস্টল হয়েছে (build-time, runtime, cache) তার
+// উপর নির্ভর করে না, তাই সব ক্ষেত্রেই সঠিকভাবে কাজ করবে।
 function nmHashMarkerPath(){ return path.join(BDIR,".nm_hash"); }
 function nodeModulesIsStale(){
   const nmDir=path.join(BDIR,"node_modules");
   if(!fs.existsSync(nmDir)) return true;
-  const curHash=botPackageHash();
-  if(!curHash) return false; // package.json ই নেই — এখানে কিছু করার নেই, launch যা আছে তাই দিয়ে চেষ্টা করবে
-  try{
-    const saved=fs.readFileSync(nmHashMarkerPath(),"utf8").trim();
-    return saved!==curHash;
-  }catch{ return true; } // মার্কার নেই মানে আগে কখনো hash রেকর্ড হয়নি — নিরাপদ থাকতে reinstall
+  const pkgPath=path.join(BDIR,"package.json");
+  let deps=[];
+  try{ deps=Object.keys(JSON.parse(fs.readFileSync(pkgPath,"utf8")).dependencies||{}); }catch{ return false; }
+  if(!deps.length) return false;
+  // প্রতিটা dependency-র ফোল্ডার বাস্তবে node_modules-এ আছে কিনা সরাসরি চেক —
+  // এটাই আসল সত্য, কোনো marker ফাইলের উপর নির্ভর করে না
+  const allPresent = deps.every(d=>fs.existsSync(path.join(nmDir,d)));
+  if(allPresent){ markNodeModulesFresh(); return false; } // সব ঠিক আছে — মার্কারও লিখে রাখা হলো পরের বার দ্রুত চেকের জন্য
+  return true;
 }
 function markNodeModulesFresh(){
   try{ const h=botPackageHash(); if(h) fs.writeFileSync(nmHashMarkerPath(),h); }catch{}
