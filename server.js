@@ -32,7 +32,6 @@ const BDIR  = path.join(__dirname, "bot");
 const LFILE = path.join(__dirname, "panel.log");
 const SFILE = path.join(__dirname, "stats.json");
 const LTFILE = path.join(__dirname, "lifetime.json"); // panel/bot RAM + mongo ব্যবহারের সর্বকালীন উচ্চতম (lifetime peak) — MongoDB-তেও ব্যাকআপ থাকে, তাই panel restart হলেও হারায় না
-const AFILE = path.join(__dirname, "alerts.json"); // ইন-প্যানেল লাইফটাইম অ্যালার্ট/নোটিফিকেশন হিস্ট্রি — MongoDB-তেও ব্যাকআপ থাকে
 const PORT  = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGODB_URI || "";
 if(!MONGO_URI) console.log("⚠️ MONGODB_URI environment variable সেট করা নেই — Render Dashboard → Environment-এ বসাও, নাহলে MongoDB ছাড়া চলবে");
@@ -73,31 +72,10 @@ let lifetime = loadJ(LTFILE,{peakPanelMB:0,peakBotMB:0,peakMongoMB:0,firstSeen:n
 const PASS = process.env.PANEL_PASSWORD || cfg.password || "admin123";
 if(!fs.existsSync(BDIR)) fs.mkdirSync(BDIR,{recursive:true});
 
-// ── ইন-প্যানেল লাইফটাইম অ্যালার্ট সিস্টেম (বেল আইকন) ── ফোনে পুশ নোটিফিকেশনের বদলে,
-// সবকিছু ওয়েবসাইটের ভিতরেই। প্রতিটা গুরুত্বপূর্ণ ঘটনা (ক্র্যাশ, npm install ব্যর্থতা,
-// প্রতিরোধমূলক রিস্টার্ট, স্টোরেজ সতর্কতা) এখানে জমা থাকে, MongoDB-তে ব্যাকআপসহ
-let alerts = loadJ(AFILE, []);
-let _alertCooldowns = {};
-function notify(level, title, message, {cooldownKey=null, cooldownMs=0} = {}){
-  if(cooldownKey){
-    const last=_alertCooldowns[cooldownKey]||0;
-    if(Date.now()-last < cooldownMs) return; // এখনো কুলডাউনে, স্কিপ
-    _alertCooldowns[cooldownKey]=Date.now();
-  }
-  const entry = { id: Date.now()+"-"+Math.random().toString(36).slice(2,7), time: new Date().toISOString(), level, title, message, read:false };
-  alerts.push(entry);
-  if(alerts.length>500) alerts.shift();
-  saveJ(AFILE, alerts);
-  saveAlertsToMongo();
-  bc({type:"alert", data: entry});
-}
-async function saveAlertsToMongo(){ await saveToMongo("__panel_alerts__", JSON.stringify(alerts), false); }
-async function restoreAlertsFromMongo(){
-  if(!db_connected || !FileModel) return;
-  try{
-    const a = await FileModel.findOne({path:"__panel_alerts__"});
-    if(a && a.content){ try{ alerts = JSON.parse(a.content.toString()); saveJ(AFILE, alerts); }catch{} }
-  }catch(e){ console.log("⚠️ alerts restore error:", e.message); }
+// ── গুরুত্বপূর্ণ ঘটনা লগে জানানো (আগে আলাদা বেল/অ্যালার্ট সিস্টেম ছিল, এখন
+// সরলতার জন্য সরিয়ে শুধু প্যানেলের লগেই দেখানো হচ্ছে) ──
+function notify(level, title, message){
+  log(`${title} — ${message}`, level==="error"?"error":level==="warn"?"warn":"info");
 }
 
 // ── MONGODB ──
@@ -124,7 +102,6 @@ async function connectMongo(){
 
     // restore files from MongoDB on startup
     await restorePanelPersistent();
-    await restoreAlertsFromMongo();
     await restoreFromMongo();
     await importRepoZipIfPresent();
 
@@ -476,15 +453,17 @@ function npmInstallAsync(maxAttempts=3){
 
 function bc(d){wss.clients.forEach(c=>{if(c.readyState===WebSocket.OPEN)c.send(JSON.stringify(d));});}
 
-// ── প্যানেল → বট তাৎক্ষণিক IPC নোটিফাই ── নতুন/সম্পাদিত/ডিলিট করা ফাইলের কথা বটকে
-// সাথে সাথে জানানো হয় (fs.watch-এর ৬০০ms ডিবাউন্সের অপেক্ষা ছাড়াই) — বট নিজেই
-// filter করে নেয় শুধু Script/commands/*.js হলে reload করবে
+// ফাইল পরিবর্তনের কথা বটকে আলাদা করে জানানো হয় না — বটের নিজস্ব fs.watch (থাকলে)
+// নিজে থেকেই ধরে নেবে। প্যানেল সরলতার জন্য এখানে হাত দেয় না।
+// নতুন/সম্পাদিত/ডিলিট করা কমান্ড ফাইলের কথা বটকে সাথে সাথে জানানো হয় (IPC) —
+// বটের নিজের fs.watch fallback থাকলেও সেটা কিছু কন্টেইনার ফাইলসিস্টেমে দেরিতে/
+// অনির্ভরযোগ্যভাবে ফায়ার করতে পারে, তাই এই সরাসরি চ্যানেলটাই মূল, তাৎক্ষণিক পথ
 function notifyBotFile(action, relPath){
   try{
     if(botProc && botProc.connected){
       botProc.send({type:"panel_file_change", action, relPath: relPath.replace(/\\/g,"/")});
     }
-  }catch(e){/* বট চালু না থাকলে/ipc না থাকলে চুপচাপ স্কিপ — সমস্যা নেই, পরের বার fs.watch ধরে নেবে */}
+  }catch(e){/* বট চালু না থাকলে/ipc না থাকলে চুপচাপ স্কিপ — সমস্যা নেই, fs.watch fallback ধরে নেবে */}
 }
 
 function log(text,type="info"){
@@ -650,66 +629,11 @@ function stopBot(){
   return {ok:true,msg:"বট বন্ধ হয়েছে"};
 }
 
-// ── WATCHDOG ── প্যানেলে "চালু" দেখালেও Messenger-এ বট আসলে সাড়া দিচ্ছে কিনা তা
-// শুধু প্রসেস জীবিত থাকা দিয়ে বোঝা যায় না — MQTT/heartbeat কার্যকলাপ না এলে ধরে
-// নেওয়া হয় সংযোগ আসলে আটকে গেছে (stale), তখন নিজে থেকেই soft-restart করে
-const WATCHDOG_STALE_MS = 20*60*1000; // ২০ মিনিট কোনো কার্যকলাপ না হলে stale ধরা হবে
-setInterval(()=>{
-  if(!botProc || !lastActivityTs) return;
-  const idleMs = Date.now()-lastActivityTs;
-  if(idleMs > WATCHDOG_STALE_MS){
-    log(`⚠️ Watchdog: বট প্রসেস চলছে কিন্তু ${Math.round(idleMs/60000)} মিনিট ধরে কোনো কার্যকলাপ/heartbeat নেই — সম্ভবত Messenger সংযোগ আটকে গেছে, নিজে থেকেই restart করা হচ্ছে`,"warn");
-    stopBot();
-    setTimeout(()=>startBot("watchdog"),3000);
-  }
-},2*60*1000);
-
-// ── কানেকশন-রিফ্রেশ (প্রতি ৬ ঘণ্টায়) ──
-// fca-unofficial (unofficial FB API লাইব্রেরি)-র একটা পরিচিত সমস্যা আছে: বট প্রসেস বেঁচে থাকে
-// (প্যানেলে "চলছে" দেখায়) কিন্তু Facebook-এর real-time message listener (MQTT) মাঝে মাঝে
-// নিঃশব্দে বন্ধ হয়ে যায় — কোনো ক্র্যাশ ছাড়াই, তাই প্যানেল এটা সাথে সাথে ধরতে পারে না।
-// এটা কোড দিয়ে ১০০% বন্ধ করা যায় না (unofficial API-র নিজস্ব সীমাবদ্ধতা), কিন্তু নিয়মিত
-// বিরতিতে connection রিফ্রেশ করলে ঝুঁকি অনেকটাই কমে।
-setInterval(()=>{
-  if(!botProc || !botFbConnected || !botStart) return;
-  const upHours=(Date.now()-botStart)/(3600*1000);
-  if(upHours>=6){
-    log("🔄 কানেকশন-রিফ্রেশ — Facebook-এর real-time listener নিঃশব্দে বন্ধ হওয়া ঠেকাতে প্রতিরোধমূলক রিস্টার্ট","warn");
-    notify("info","🔄 কানেকশন-রিফ্রেশ","প্রতি ৬ ঘণ্টায় প্রতিরোধমূলক রিস্টার্ট হয়েছে (Facebook listener সতেজ রাখতে)।",{cooldownKey:"conn-refresh",cooldownMs:5*60*60*1000});
-    stopBot(); setTimeout(()=>startBot("connection-refresh"),3000);
-  }
-},10*60*1000);
-
-// ── প্রতিরোধমূলক RAM গার্ড ── প্রতি ৩০ সেকেন্ডে চেক করা হয় — RAM যদি ক্রমাগত ৪৭০MB+
-// থাকে (Render-এর ৫১২MB হার্ড সীমার কাছাকাছি), তাহলে OOM crash হওয়ার আগেই বট নিজে
-// থেকে গ্রেসফুলি রিস্টার্ট করে দেয়
-let _highRamStreak=0;
-setInterval(()=>{
-  if(!botProc){_highRamStreak=0;return;}
-  const botMB=getBotMemMB();
-  if(botMB==null) return;
-  if(botMB>=470){
-    _highRamStreak++;
-    if(_highRamStreak>=3){ // পরপর ৩ বার (≈১.৫ মিনিট) উচ্চ থাকলেই তবে রিস্টার্ট — এক-দুইবারের স্পাইকে না
-      log(`🛡️ প্রতিরোধমূলক রিস্টার্ট — বট RAM ${botMB}MB (৫১২MB সীমার কাছাকাছি)`,"warn");
-      notify("warn","🛡️ প্রতিরোধমূলক রিস্টার্ট",`বট RAM ${botMB}MB ছুঁয়ে ফেলেছিল (সীমা ৫১২MB) — ক্র্যাশ হওয়ার আগেই নিজে থেকে নিরাপদে রিস্টার্ট করা হলো।`,{cooldownKey:"preventive-restart",cooldownMs:10*60*1000});
-      _highRamStreak=0;
-      stopBot(); setTimeout(()=>startBot("preventive-ram-guard"),3000);
-    }
-  } else { _highRamStreak=0; }
-},30*1000);
-
-// ── MongoDB স্টোরেজ প্রায় শেষ হয়ে গেলে দিনে একবার সতর্ক করা ──
-setInterval(async()=>{
-  if(!db_connected || !mongoose?.connection?.db) return;
-  try{
-    const s=await mongoose.connection.db.stats();
-    const usedMB=(s.dataSize+s.indexSize)/1024/1024;
-    if(usedMB>512*0.85){
-      notify("warn","⚠️ MongoDB স্টোরেজ প্রায় শেষ",`${Math.round(usedMB)}MB / 512MB ব্যবহার হয়ে গেছে (Atlas M0 ফ্রি সীমা)। পুরনো/অপ্রয়োজনীয় ডেটা সরানো দরকার হতে পারে।`,{cooldownKey:"mongo-storage-warn",cooldownMs:24*60*60*1000});
-    }
-  }catch{}
-},30*60*1000);
+// ── স্ট্যাটাস ট্র্যাকিং শুধু তথ্যের জন্য ── প্যানেল নিজে থেকে কোনো প্রতিরোধমূলক
+// রিস্টার্ট করে না (আগে watchdog/৬-ঘণ্টা-রিফ্রেশ/RAM-guard ছিল, প্রতিটা মানেই নতুন
+// Facebook লগইন attempt — ঘন ঘন restart হলে Facebook সন্দেহজনক মনে করে account/IP
+// flag করে দিতে পারে)। বট ক্র্যাশ করলে auto-restart (নিচে) হবে, কিন্তু "চালু আছে
+// তবে idle" অবস্থায় প্যানেল নিজে থেকে restart করবে না — দরকার হলে ম্যানুয়ালি করো।
 
 // ── SELF PING ──
 function selfPing(){
@@ -890,19 +814,6 @@ function getCpuPercent(){
   if(dtMs<=0) return 0;
   return Math.min(100,Math.round((cpuMs/dtMs)*100));
 }
-app.get("/api/system/terminal",auth,(req,res)=>{
-  const net=getNetSpeed();
-  const botMB=getBotMemMB(), panelMB=Math.round(process.memoryUsage().rss/1024/1024);
-  res.json({
-    ok:true, time:Date.now(), net,
-    cpuPercent: getCpuPercent(),
-    ramPercent: Math.min(100, Math.round(((botMB||0)+panelMB)/512*100)),
-    botRunning: !!botProc, fbConnected: botFbConnected, heavy: getHeavyStatus(),
-    uptimeSec: botStart?Math.floor((Date.now()-botStart)/1000):0,
-    tail: botLogs.slice(-8).map(l=>({time:l.time,text:l.text,type:l.type}))
-  });
-});
-
 app.get("/api/system/live",auth,async(req,res)=>{
   let mongoStats = null;
   if(db_connected && mongoose && mongoose.connection && mongoose.connection.db){
@@ -968,84 +879,6 @@ app.get("/api/file/read",auth,(req,res)=>{
     if(s.size>5*1024*1024) return res.json({error:"ফাইল অনেক বড় (5MB+)"});
     res.json({content:fs.readFileSync(f,"utf8"),size:s.size});
   }catch(e){res.status(500).json({error:e.message});}
-});
-
-// ── কমান্ড ফাইল টেস্টার (নন-ব্লকিং) ──
-// পুরনো প্যানেলে এখানে spawnSync ব্যবহার হতো, যেটা প্রতিবার "🧪 টেস্ট" চাপলেই পুরো
-// ইভেন্ট-লুপ কয়েক সেকেন্ডের জন্য ব্লক করে দিত — পুরনো স্ক্রিনশটে যে "শুধু লোডিং" bug
-// দেখানো হয়েছিল তার আসল কারণ এটাই ছিল। এখন async spawn, প্যানেল ব্লক হয় না।
-function spawnAsync(cmd,args,opts={}){
-  return new Promise(resolve=>{
-    const p=spawn(cmd,args,{...opts});
-    let out="",err="";
-    const killT=setTimeout(()=>{try{p.kill("SIGKILL");}catch{}},opts.timeout||10000);
-    p.stdout&&p.stdout.on("data",d=>out+=d.toString());
-    p.stderr&&p.stderr.on("data",d=>err+=d.toString());
-    p.on("exit",code=>{clearTimeout(killT);resolve({status:code,stdout:out,stderr:err});});
-    p.on("error",e=>{clearTimeout(killT);resolve({status:-1,stdout:"",stderr:e.message});});
-  });
-}
-function testUrl(url){
-  return new Promise(resolve=>{
-    try{
-      const mod=url.startsWith("https")?https:http2;
-      const req=mod.request(url,{method:"HEAD",timeout:6000},r=>{resolve({url,ok:r.statusCode<400,status:r.statusCode});r.resume();});
-      req.on("timeout",()=>{req.destroy();resolve({url,ok:false,status:"timeout"});});
-      req.on("error",e=>resolve({url,ok:false,status:"error: "+e.message}));
-      req.end();
-    }catch(e){resolve({url,ok:false,status:"error: "+e.message});}
-  });
-}
-app.post("/api/file/test",auth,async(req,res)=>{
-  try{
-    const f=safe(BDIR,req.body.path);
-    if(!fs.existsSync(f)) return res.json({ok:false,msg:"ফাইল খুঁজে পাওয়া যায়নি"});
-    const content=fs.readFileSync(f,"utf8");
-    const result={syntax:null,structure:null,dependencies:[],apis:[]};
-    const chk=await spawnAsync(process.execPath,["--check",f],{timeout:10000});
-    result.syntax=chk.status===0
-      ? {ok:true,msg:"সিনট্যাক্স ঠিক আছে ✅"}
-      : {ok:false,msg:(chk.stderr||"").split("\n").slice(0,4).join(" ")||"সিনট্যাক্স এরর"};
-    if(result.syntax.ok){
-      const probe=await spawnAsync(process.execPath,["-e",`
-        try{
-          const cmd = require(${JSON.stringify(f)});
-          const out = {
-            hasConfig: !!(cmd && cmd.config),
-            name: cmd?.config?.name || null,
-            aliases: cmd?.config?.aliases || [],
-            hasRunFn: !!(cmd && (cmd.run || cmd.onStart || cmd.onCall)),
-            dependencies: cmd?.config?.dependencies || {}
-          };
-          console.log("###RESULT###"+JSON.stringify(out));
-        }catch(e){ console.log("###ERROR###"+e.message); }
-      `],{cwd:path.dirname(f),timeout:8000});
-      const out=probe.stdout||"";
-      if(out.includes("###ERROR###")){
-        result.structure={ok:false,msg:"ফাইল লোড করতে ব্যর্থ: "+out.split("###ERROR###")[1].trim().slice(0,200)};
-      } else if(out.includes("###RESULT###")){
-        try{
-          const parsed=JSON.parse(out.split("###RESULT###")[1].trim());
-          const problems=[];
-          if(!parsed.hasConfig) problems.push("module.exports.config নেই");
-          if(!parsed.name) problems.push("config.name নেই");
-          if(!parsed.hasRunFn) problems.push("run/onStart/onCall ফাংশন নেই");
-          result.structure=problems.length
-            ? {ok:false,msg:"সমস্যা: "+problems.join(", ")}
-            : {ok:true,msg:`ঠিক আছে ✅ — নাম: "${parsed.name}"${parsed.aliases.length?", alias: "+parsed.aliases.join(", "):""}`};
-          for(const [pkg] of Object.entries(parsed.dependencies||{})){
-            try{require.resolve(pkg,{paths:[path.join(BDIR,"node_modules")]});result.dependencies.push({pkg,ok:true});}
-            catch{result.dependencies.push({pkg,ok:false});}
-          }
-        }catch{result.structure={ok:false,msg:"ফলাফল পার্স করতে ব্যর্থ"};}
-      } else {
-        result.structure={ok:false,msg:"টাইমআউট বা কোনো আউটপুট পাওয়া যায়নি (৮ সেকেন্ডের বেশি সময় নিয়েছে)"};
-      }
-      const urls=[...new Set((content.match(/https?:\/\/[^\s"'`)]+/g)||[]))].slice(0,5);
-      result.apis=await Promise.all(urls.map(testUrl));
-    }
-    res.json({ok:true,result});
-  }catch(e){res.status(500).json({ok:false,error:e.message});}
 });
 
 app.post("/api/file/save",auth,async(req,res)=>{
@@ -1393,8 +1226,6 @@ app.post("/api/cookie/save",auth,async(req,res)=>{
 });
 
 // ── SETTINGS ──
-app.get("/api/alerts",auth,(req,res)=>res.json({alerts: alerts.slice().reverse()}));
-app.post("/api/alerts/clear",auth,(req,res)=>{alerts=[];saveJ(AFILE,alerts);saveAlertsToMongo();res.json({ok:true});});
 app.get("/api/settings",auth,(req,res)=>res.json({...cfg,mongoConnected:db_connected}));
 app.post("/api/settings/save",auth,(req,res)=>{
   Object.assign(cfg,req.body);
@@ -1512,26 +1343,6 @@ body{background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,sans-
 .dot.on{background:var(--gr);box-shadow:0 0 8px var(--gr);animation:blink 2s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .top-out{padding:6px 10px;border-radius:8px;border:1px solid rgba(240,82,82,.3);background:transparent;color:var(--rd);font-size:11px;cursor:pointer}
-.bell-btn{position:relative;background:transparent;border:1px solid var(--bd);border-radius:9px;padding:5px 9px;font-size:15px;cursor:pointer;color:var(--tx)}
-.bell-badge{position:absolute;top:-5px;right:-5px;background:var(--rd);color:#fff;font-size:9px;font-weight:800;min-width:16px;height:16px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 3px}
-.alert-banner{position:fixed;top:58px;left:8px;right:8px;z-index:500;display:flex;flex-direction:column;gap:6px;pointer-events:none}
-.alert-banner-item{pointer-events:auto;background:var(--s2);border:1px solid var(--bd);border-left:4px solid var(--bl);border-radius:10px;padding:10px 12px;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.4);animation:alertSlide .3s ease;display:flex;gap:8px;align-items:flex-start}
-.alert-banner-item.error{border-left-color:var(--rd)}
-.alert-banner-item.warn{border-left-color:var(--yw)}
-.alert-banner-item.info{border-left-color:var(--bl)}
-@keyframes alertSlide{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}
-.alert-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:600}
-.alert-overlay.show{display:block}
-.alert-drawer{position:fixed;top:0;right:-100%;width:min(420px,92vw);height:100%;background:var(--s1);z-index:601;transition:right .25s ease;box-shadow:-10px 0 40px rgba(0,0,0,.5);display:flex;flex-direction:column}
-.alert-drawer.show{right:0}
-.alert-drawer-head{display:flex;justify-content:space-between;align-items:center;padding:16px;border-bottom:1px solid var(--bd)}
-.alert-list{flex:1;overflow-y:auto;padding:10px}
-.alert-item{background:var(--s2);border-left:3px solid var(--bd);border-radius:8px;padding:10px 12px;margin-bottom:8px;font-size:12px}
-.alert-item.error{border-left-color:var(--rd)}
-.alert-item.warn{border-left-color:var(--yw)}
-.alert-item.info{border-left-color:var(--bl)}
-.alert-item-title{font-weight:700;margin-bottom:3px}
-.alert-item-time{font-size:10px;color:var(--mu);margin-top:4px}
 .tabs{position:fixed;bottom:0;left:0;right:0;background:rgba(13,13,24,.97);backdrop-filter:blur(20px);border-top:1px solid var(--bd);display:grid;grid-template-columns:repeat(5,1fr);height:60px;z-index:200;padding-bottom:env(safe-area-inset-bottom)}
 .tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;cursor:pointer;border:none;background:transparent;color:var(--mu);transition:.15s;position:relative}
 .tab.active{color:var(--ac)}
@@ -1706,22 +1517,8 @@ textarea.ci:focus{border-color:var(--ac)}
     <div class="top-pill"><div class="dot" id="tDot"></div><span id="tStatus">লোড...</span></div>
     <div class="top-pill" id="mongoPill"><div class="dot" id="mongoDot"></div><span id="mongoStatus">DB</span></div>
   </div>
-  <button class="bell-btn" onclick="openAlerts()">🔔<span class="bell-badge" id="bellBadge" style="display:none">0</span></button>
   <button class="top-out" onclick="location.href='/logout'">বের</button>
 </div>
-
-<div id="alertBanner" class="alert-banner"></div>
-<div id="alertDrawer" class="alert-drawer">
-  <div class="alert-drawer-head">
-    <div style="font-weight:800;font-size:15px">🔔 নোটিফিকেশন (লাইফটাইম)</div>
-    <div style="display:flex;gap:8px">
-      <button class="tbtn" onclick="clearAlerts()">🗑 মুছো</button>
-      <button class="tbtn" onclick="closeAlerts()">✕ বন্ধ</button>
-    </div>
-  </div>
-  <div id="alertList" class="alert-list"></div>
-</div>
-<div id="alertOverlay" class="alert-overlay" onclick="closeAlerts()"></div>
 
 <div class="main">
 
@@ -1863,27 +1660,6 @@ textarea.ci:focus{border-color:var(--ac)}
   <div class="lbox" id="lbox"></div>
 </div>
 
-<!-- TERMINAL -->
-<div id="pg-term" class="page">
-  <div class="term-box" id="termBox">
-    <div class="term-line">Bot Panel Terminal — লাইভ সিস্টেম মনিটর</div>
-    <div class="term-line">সংযোগ করা হচ্ছে...</div>
-  </div>
-</div>
-
-<!-- COMMAND TEST -->
-<div id="pg-test" class="page">
-  <div class="test-wrap">
-    <div class="test-row">
-      <input type="text" id="testPath" placeholder="যেমনঃ Script/commands/mycommand.js">
-      <button class="tbtn p" onclick="testFile()">🧪 টেস্ট করো</button>
-    </div>
-    <div style="font-size:11px;color:var(--mu);margin:6px 2px 10px">উপরে existing ফাইলের path দাও, অথবা নিচে নতুন/সংশোধিত কোড পেস্ট করে "টেস্ট করো" চাপলে সেভ + টেস্ট দুটোই একসাথে হবে</div>
-    <textarea id="testCode" class="test-code" placeholder="কমান্ড ফাইলের কোড এখানে পেস্ট করো (ঐচ্ছিক — খালি রাখলে উপরের path-এর ফাইলটাই টেস্ট হবে)"></textarea>
-    <div id="testResult" class="test-result"></div>
-  </div>
-</div>
-
 <!-- FILES -->
 <div id="pg-files" class="page">
   <div id="edView" style="display:none">
@@ -2020,8 +1796,6 @@ textarea.ci:focus{border-color:var(--ac)}
   <button class="tab active" onclick="goTab('home',this)"><span class="ti">🏠</span><span class="tl">হোম</span></button>
   <button class="tab" onclick="goTab('monitor',this)"><span class="ti">📊</span><span class="tl">মনিটর</span></button>
   <button class="tab" onclick="goTab('logs',this)"><span class="ti">📋</span><span class="tl">লগ</span></button>
-  <button class="tab" onclick="goTab('term',this)"><span class="ti">🖥️</span><span class="tl">টার্মিনাল</span></button>
-  <button class="tab" onclick="goTab('test',this)"><span class="ti">🧪</span><span class="tl">টেস্ট</span></button>
   <button class="tab" onclick="goTab('files',this)"><span class="ti">📁</span><span class="tl">ফাইল</span></button>
   <button class="tab" onclick="goTab('more',this)"><span class="ti">⚙️</span><span class="tl">আরো</span></button>
 </div>
@@ -2044,15 +1818,12 @@ function goTab(id,btn){
   btn.classList.add("active");
   document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
   document.getElementById("pg-"+id).classList.add("active");
-  if(id!=="term" && _termTimer){ clearInterval(_termTimer); _termTimer=null; }
   if(id==="files") loadFiles(curDir);
   if(id==="more"){loadEnv();loadSettings();}
   if(id==="logs") document.getElementById("lbox").scrollTop=document.getElementById("lbox").scrollHeight;
   if(id==="upload"){document.getElementById("uploadDir").textContent=curDir||"root";}
   if(id==="monitor") loadMonitor();
-  if(id==="term"){ loadTerminal(); _termTimer=setInterval(loadTerminal,1500); }
 }
-let _termTimer=null;
 function goUploadHere(){
   document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
   document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
@@ -2071,53 +1842,9 @@ function connectWS(){
     if(m.type==="status") updateStatus(m.running,m.fbConnected);
     if(m.type==="clearLogs") document.getElementById("lbox").innerHTML="";
     if(m.type==="mongo") updateMongo(m.connected);
-    if(m.type==="alert"){ showAlertBanner(m.data); _alertsCache.unshift(m.data); _unreadAlerts++; updateBellBadge(); if(document.getElementById("alertDrawer").classList.contains("show")) renderAlertList(); }
   };
   ws.onclose=()=>setTimeout(connectWS,3000);
 }
-
-// ── ইন-প্যানেল অ্যালার্ট সিস্টেম (বেল আইকন) ──
-let _alertsCache=[], _unreadAlerts=0;
-const _lvlIcon={info:"ℹ️",warn:"⚠️",error:"🔴"};
-function showAlertBanner(a){
-  const box=document.getElementById("alertBanner");
-  const d=document.createElement("div");
-  d.className="alert-banner-item "+(a.level||"info");
-  d.innerHTML='<span>'+(_lvlIcon[a.level]||"ℹ️")+'</span><div><b>'+esc(a.title)+'</b><div style="color:var(--mu);margin-top:2px">'+esc(a.message)+'</div></div><span class="ab-x" onclick="this.parentElement.remove()" style="cursor:pointer">✕</span>';
-  box.appendChild(d);
-  setTimeout(()=>{ if(d.parentElement) d.remove(); }, 8000);
-}
-function updateBellBadge(){
-  const b=document.getElementById("bellBadge");
-  if(_unreadAlerts>0){ b.style.display="flex"; b.textContent=_unreadAlerts>99?"99+":_unreadAlerts; }
-  else b.style.display="none";
-}
-function renderAlertList(){
-  const list=document.getElementById("alertList");
-  if(!_alertsCache.length){ list.innerHTML='<div style="text-align:center;color:var(--mu);padding:30px 10px">🔕 কোনো নোটিফিকেশন নেই</div>'; return; }
-  list.innerHTML=_alertsCache.map(a=>
-    '<div class="alert-item '+(a.level||"info")+'"><div class="alert-item-title">'+(_lvlIcon[a.level]||"ℹ️")+' '+esc(a.title)+'</div><div>'+esc(a.message)+'</div><div class="alert-item-time">'+new Date(a.time).toLocaleString("bn-BD")+'</div></div>'
-  ).join("");
-}
-async function openAlerts(){
-  document.getElementById("alertDrawer").classList.add("show");
-  document.getElementById("alertOverlay").classList.add("show");
-  _unreadAlerts=0; updateBellBadge();
-  try{ const d=await fetch("/api/alerts").then(r=>r.json()); _alertsCache=d.alerts||[]; }catch{}
-  renderAlertList();
-}
-function closeAlerts(){
-  document.getElementById("alertDrawer").classList.remove("show");
-  document.getElementById("alertOverlay").classList.remove("show");
-}
-async function clearAlerts(){
-  if(!confirm("সব নোটিফিকেশন মুছবে?")) return;
-  await fetch("/api/alerts/clear",{method:"POST"});
-  _alertsCache=[]; renderAlertList();
-}
-(async function initAlerts(){
-  try{ const d=await fetch("/api/alerts").then(r=>r.json()); _alertsCache=d.alerts||[]; }catch{}
-})();
 
 function appendLog(e){
   if(logFilter!=="all"&&e.type!==logFilter)return;
@@ -2226,69 +1953,6 @@ async function refresh(){
 
 // LIVE MONITOR
 function _mColor(pct){ return pct<60?"var(--gr)":pct<85?"var(--yw)":"var(--rd)"; }
-async function loadTerminal(){
-  try{
-    const d=await fetch("/api/system/terminal").then(r=>r.json());
-    const box=document.getElementById("termBox");
-    const now=new Date().toLocaleTimeString("bn-BD");
-    const gauge=(pct)=>'<span class="term-gauge"><i style="width:'+Math.min(100,pct||0)+'%;background:'+(pct>85?"#ff5c5c":pct>60?"#ffd24d":"#4dff4d")+'"></i></span>'+Math.round(pct||0)+'%';
-    let html='';
-    html+='<div class="term-line head">┌─[belal@bot-panel]─['+now+']</div>';
-    html+='<div class="term-line">│ বট স্ট্যাটাস : '+(d.botRunning?(d.fbConnected?"🟢 RUNNING (Messenger সংযুক্ত)":"🟡 RUNNING (সংযোগ যাচাই হচ্ছে)"):"🔴 STOPPED")+'</div>';
-    html+='<div class="term-line">│ Uptime      : '+fmtT(d.uptimeSec||0)+'</div>';
-    html+='<div class="term-line">│ CPU         : '+gauge(d.cpuPercent)+'</div>';
-    html+='<div class="term-line">│ RAM (512MB) : '+gauge(d.ramPercent)+'</div>';
-    html+='<div class="term-line">│ NET ↓'+(d.net?.rxKBs??"--")+'KB/s  ↑'+(d.net?.txKBs??"--")+'KB/s</div>';
-    if(d.heavy?.active) html+='<div class="term-line warn">│ ⚠ ভারী টাস্ক চলছে: '+d.heavy.active+' (max '+d.heavy.max+')</div>';
-    html+='<div class="term-line head">└──────────────────────────────</div>';
-    html+='<div class="term-line">$ tail -f panel.log</div>';
-    (d.tail||[]).forEach(l=>{
-      const cls=l.type==="error"?"error":l.type==="warn"?"warn":"";
-      html+='<div class="term-line '+cls+'">['+l.time+'] '+esc(l.text)+'</div>';
-    });
-    const wasAtBottom = box.scrollTop+box.clientHeight >= box.scrollHeight-20;
-    box.innerHTML=html;
-    if(wasAtBottom) box.scrollTop=box.scrollHeight;
-  }catch(e){/* সাময়িক নেটওয়ার্ক গ্যাপ — পরের পোলে ঠিক হয়ে যাবে */}
-}
-
-async function testFile(pathOverride){
-  const pathInput=document.getElementById("testPath");
-  if(pathOverride) pathInput.value=pathOverride;
-  const p=pathInput.value.trim();
-  const code=document.getElementById("testCode").value;
-  const resBox=document.getElementById("testResult");
-  if(!p){ toast("❌ আগে ফাইলের path দাও","error"); return; }
-  resBox.innerHTML='<div class="test-card">⏳ টেস্ট চলছে...</div>';
-  try{
-    if(code.trim()){
-      await fetch("/api/file/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:p,content:code})});
-    }
-    const d=await fetch("/api/file/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:p})}).then(r=>r.json());
-    if(!d.ok){ resBox.innerHTML='<div class="test-card fail"><div class="test-card-title">❌ ব্যর্থ</div>'+esc(d.msg||d.error||"অজানা সমস্যা")+'</div>'; return; }
-    const r=d.result;
-    let html='';
-    html+='<div class="test-card '+(r.syntax?.ok?"ok":"fail")+'"><div class="test-card-title">'+(r.syntax?.ok?"✅":"❌")+' সিনট্যাক্স</div>'+esc(r.syntax?.msg||"")+'</div>';
-    if(r.structure) html+='<div class="test-card '+(r.structure.ok?"ok":"fail")+'"><div class="test-card-title">'+(r.structure.ok?"✅":"❌")+' স্ট্রাকচার</div>'+esc(r.structure.msg||"")+'</div>';
-    if(r.dependencies?.length){
-      html+='<div class="test-card"><div class="test-card-title">📦 Dependencies</div>'+r.dependencies.map(x=>'<div class="test-api-row"><span>'+esc(x.pkg)+'</span><span>'+(x.ok?"✅ ইনস্টল আছে":"❌ নেই")+'</span></div>').join("")+'</div>';
-    }
-    if(r.apis?.length){
-      html+='<div class="test-card"><div class="test-card-title">🌐 API লিংক টেস্ট</div>'+r.apis.map(x=>'<div class="test-api-row"><span style="word-break:break-all">'+esc(x.url)+'</span><span>'+(x.ok?"✅ "+x.status:"❌ "+x.status)+'</span></div>').join("")+'</div>';
-    }
-    resBox.innerHTML=html;
-    toast(r.syntax?.ok&&(!r.structure||r.structure.ok)?"✅ টেস্ট সম্পন্ন":"⚠️ সমস্যা পাওয়া গেছে",r.syntax?.ok?"success":"warn");
-  }catch(e){ resBox.innerHTML='<div class="test-card fail">❌ টেস্ট চালাতে ব্যর্থ: '+esc(e.message)+'</div>'; }
-}
-function quickTest(fp){ 
-  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
-  document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
-  document.getElementById("pg-test").classList.add("active");
-  [...document.querySelectorAll(".tab")].find(b=>b.getAttribute("onclick")?.includes("'test'"))?.classList.add("active");
-  document.getElementById("testCode").value="";
-  testFile(fp);
-}
-
 async function loadMonitor(){
   try{
     const d=await fetch("/api/system/live").then(r=>r.json());
@@ -2437,7 +2101,6 @@ async function loadFiles(dir){
       +'<div class="fn"><div class="fn-name">'+langDot(item.name,item.isDir)+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?' · <span data-mtime="'+item.mtime+'">'+fdt(item.mtime)+'</span>':"")+'</div></div>'
       +'<div class="fa">'
       +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
-      +(!item.isDir && /\.js$/i.test(item.name)?'<button class="fab" onclick="event.stopPropagation();quickTest(\\''+fp+'\\')">🧪</button>':'')
       +'<button class="fab" onclick="event.stopPropagation();dlF(\\''+fp+'\\')">⬇️</button>'
       +'<button class="fab" onclick="event.stopPropagation();showRename(\\''+fp+'\\',\\''+item.name+'\\')">🔤</button>'
       +'<button class="fab" onclick="event.stopPropagation();showCopy(\\''+fp+'\\')">📋</button>'
