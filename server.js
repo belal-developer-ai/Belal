@@ -876,7 +876,7 @@ app.get("/api/files",auth,(req,res)=>{
 app.get("/api/file/read",auth,(req,res)=>{
   try{
     const f=safe(BDIR,req.query.path),s=fs.statSync(f);
-    if(s.size>5*1024*1024) return res.json({error:"ফাইল অনেক বড় (5MB+)"});
+    if(s.size>20*1024*1024) return res.json({error:"ফাইল অনেক বড় (20MB+) — এডিটরে খোলা যাবে না, তবে আপলোড/ডাউনলোড করা যাবে"});
     res.json({content:fs.readFileSync(f,"utf8"),size:s.size});
   }catch(e){res.status(500).json({error:e.message});}
 });
