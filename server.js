@@ -861,82 +861,6 @@ app.get("/api/backup",auth,(req,res)=>{
 });
 
 // ── FILE API ──
-// ── সাম্প্রতিক সম্পাদিত ফাইল (হোম পেজের জন্য) ──
-app.get("/api/files/recent",auth,(req,res)=>{
-  try{
-    const limit=Math.min(parseInt(req.query.limit)||8,30);
-    const results=[];
-    const SKIP=new Set(["node_modules",".git"]);
-    (function walk(dir,rel,depth){
-      if(depth>6) return; // খুব গভীর ফোল্ডারে না যাওয়া, পারফরম্যান্সের জন্য
-      let entries; try{ entries=fs.readdirSync(dir,{withFileTypes:true}); }catch{ return; }
-      for(const e of entries){
-        if(SKIP.has(e.name)||e.name.startsWith(".")) continue;
-        const full=path.join(dir,e.name), relPath=rel?rel+"/"+e.name:e.name;
-        if(e.isDirectory()) walk(full,relPath,depth+1);
-        else{
-          try{ const s=fs.statSync(full); results.push({name:e.name,path:relPath,mtime:s.mtime}); }catch{}
-        }
-      }
-    })(BDIR,"",0);
-    results.sort((a,b)=>new Date(b.mtime)-new Date(a.mtime));
-    res.json({items:results.slice(0,limit)});
-  }catch(e){res.status(500).json({error:e.message});}
-});
-
-// ── ফোল্ডার zip করে ডাউনলোড ──
-app.get("/api/files/zip",auth,(req,res)=>{
-  try{
-    const dir=safe(BDIR,req.query.path||"");
-    if(!fs.existsSync(dir)||!fs.statSync(dir).isDirectory()) return res.status(400).json({error:"ফোল্ডার পাওয়া যায়নি"});
-    const zipName=(path.basename(dir)||"root")+".zip";
-    res.setHeader("Content-Type","application/zip");
-    res.setHeader("Content-Disposition",`attachment; filename="${zipName}"`);
-    const archive=archiver("zip",{zlib:{level:6}});
-    archive.on("error",err=>{ try{res.status(500).end(err.message);}catch{} });
-    archive.pipe(res);
-    archive.directory(dir,false);
-    archive.finalize();
-  }catch(e){res.status(500).json({error:e.message});}
-});
-
-// ── বাল্ক ডিলিট/মুভ (একসাথে একাধিক ফাইল/ফোল্ডার) ──
-app.post("/api/files/bulk",auth,async(req,res)=>{
-  try{
-    const {action,paths,destination}=req.body;
-    if(!Array.isArray(paths)||!paths.length) return res.json({ok:false,msg:"কোনো ফাইল সিলেক্ট করা হয়নি"});
-    const results=[];
-    if(action==="delete"){
-      for(const p of paths){
-        try{
-          const f=safe(BDIR,p);
-          fs.rmSync(f,{recursive:true,force:true});
-          await deleteFromMongo(path.relative(BDIR,f));
-          notifyBotFile("delete", path.relative(BDIR,f));
-          results.push({path:p,ok:true});
-        }catch(e){ results.push({path:p,ok:false,msg:e.message}); }
-      }
-    } else if(action==="move"){
-      const destDir=safe(BDIR,destination||"");
-      fs.mkdirSync(destDir,{recursive:true});
-      for(const p of paths){
-        try{
-          const from=safe(BDIR,p), to=path.join(destDir,path.basename(from));
-          fs.renameSync(from,to);
-          const fromRel=path.relative(BDIR,from), toRel=path.relative(BDIR,to);
-          await deleteFromMongo(fromRel);
-          if(fs.statSync(to).isDirectory()) await syncDirToMongo(to,toRel);
-          else await saveToMongo(toRel,fs.readFileSync(to));
-          notifyBotFile("delete", fromRel); notifyBotFile("update", toRel);
-          results.push({path:p,ok:true});
-        }catch(e){ results.push({path:p,ok:false,msg:e.message}); }
-      }
-    } else return res.json({ok:false,msg:"অজানা action"});
-    const failCount=results.filter(r=>!r.ok).length;
-    res.json({ok:failCount===0,results,msg:failCount?`${results.length-failCount}/${results.length} সফল`:`${results.length}টা সফল হয়েছে`});
-  }catch(e){res.status(500).json({ok:false,msg:e.message});}
-});
-
 app.get("/api/files",auth,(req,res)=>{
   try{
     const dir=safe(BDIR,req.query.path||"");
@@ -1490,18 +1414,13 @@ textarea.ci:focus{border-color:var(--ac)}
 .log-bar::-webkit-scrollbar{display:none}
 .lf{padding:5px 10px;border-radius:7px;border:1px solid var(--bd);background:transparent;color:var(--mu);font-size:11px;cursor:pointer;white-space:nowrap;transition:.15s}
 .lf.on{background:var(--ac);color:#fff;border-color:var(--ac)}
-.lbox{background:#020209;border:1px solid var(--bd);border-radius:12px;padding:8px;height:calc(100vh - 210px);overflow-y:auto;font-family:'Courier New',monospace;font-size:11px}
-.le{display:flex;gap:8px;padding:7px 10px;line-height:1.6;margin-bottom:5px;border-radius:8px;border-left:3px solid var(--bd);background:rgba(255,255,255,.02);align-items:flex-start}
-.le .lico{flex-shrink:0;font-size:12px;line-height:1.6}
-.lt{color:var(--mu);white-space:nowrap;font-size:10px;flex-shrink:0;padding-top:1px}
-.lx{word-break:normal;overflow-wrap:anywhere;line-height:1.55;flex:1}
-.li{border-left-color:#4a5568;background:rgba(148,163,184,.05)}
-.ls{border-left-color:var(--gr);background:rgba(34,197,94,.07)}
-.lr{border-left-color:var(--rd);background:rgba(240,82,82,.08)}
-.lw{border-left-color:var(--yw);background:rgba(234,179,8,.07)}
-.li .lx{color:#b8c2cc}.ls .lx{color:#6ee7a8}.lr .lx{color:#ff8080}.lw .lx{color:#fbd158}
+.lbox{background:#020209;border:1px solid var(--bd);border-radius:12px;padding:10px;height:calc(100vh - 210px);overflow-y:auto;font-family:'Courier New',monospace;font-size:11px}
 .lbox::-webkit-scrollbar{width:3px}
 .lbox::-webkit-scrollbar-thumb{background:var(--bd);border-radius:2px}
+.le{display:flex;gap:5px;padding:2px 0;line-height:1.6}
+.lt{color:var(--mu);white-space:nowrap;font-size:10px;flex-shrink:0}
+.lx{word-break:normal;overflow-wrap:anywhere;line-height:1.55}
+.li .lx{color:#9ca3af}.ls .lx{color:var(--gr)}.lr .lx{color:var(--rd)}.lw .lx{color:var(--yw)}
 .pathbar{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:8px 12px;font-size:12px;color:var(--mu);margin-bottom:10px;overflow-x:auto;white-space:nowrap;display:flex;align-items:center;gap:4px}
 .pathbar::-webkit-scrollbar{display:none}
 .pp{color:var(--ac);cursor:pointer;font-weight:600}.pp:hover{text-decoration:underline}
@@ -1615,12 +1534,6 @@ textarea.ci:focus{border-color:var(--ac)}
     <div class="sc"><div class="sc-i">💥</div><div class="sc-v" id="cCrash">--</div><div class="sc-l">Crash</div></div>
     <div class="sc"><div class="sc-i">🕐</div><div class="sc-v" id="cTup">--</div><div class="sc-l">মোট Uptime</div></div>
     <div class="sc"><div class="sc-i">🖥️</div><div class="sc-v" id="cNode">--</div><div class="sc-l">Node.js</div></div>
-  </div>
-
-  <!-- RECENT FILES -->
-  <div class="cookie-box" style="margin-top:14px">
-    <div style="font-size:13px;font-weight:700;margin-bottom:8px">🕘 সাম্প্রতিক সম্পাদিত ফাইল</div>
-    <div id="recentFilesList" style="font-size:12px;color:var(--mu)">লোড হচ্ছে...</div>
   </div>
 
   <!-- COOKIE -->
@@ -1766,16 +1679,9 @@ textarea.ci:focus{border-color:var(--ac)}
       <button class="tbtn p" onclick="goUploadHere()">⬆️ আপলোড</button>
       <button class="tbtn p" onclick="showM('newfile')">📄+</button>
       <button class="tbtn" onclick="loadFiles(curDir)">🔄</button>
-      <button class="tbtn" id="selModeBtn" onclick="toggleSelectMode()">☑️ সিলেক্ট</button>
-      <button class="tbtn" onclick="downloadFolderZip()">📦 zip ডাউনলোড</button>
       <button class="tbtn" onclick="editF('package.json')">📋 pkg</button>
       <button class="tbtn" onclick="editF('index.js')">📜 index</button>
       <button class="tbtn" onclick="editF('.env')">🔐 env</button>
-    </div>
-    <div id="bulkBar" style="display:none;gap:8px;margin-bottom:10px;align-items:center">
-      <span id="bulkCount" style="font-size:12px;color:var(--mu)">0টা সিলেক্ট</span>
-      <button class="tbtn" onclick="showBulkMoveModal()">📂 মুভ</button>
-      <button class="tbtn del" onclick="bulkDelete()">🗑 ডিলিট</button>
     </div>
     <input class="sinput" type="text" id="fq" placeholder="🔍 ফাইল খোঁজুন..." oninput="doFS()">
     <div id="fsRes" style="display:none;margin-bottom:10px"></div>
@@ -1808,9 +1714,6 @@ textarea.ci:focus{border-color:var(--ac)}
     <div style="font-size:13px;font-weight:700;margin-bottom:10px">📄 একক ফাইল আপলোড</div>
     <input type="file" id="singleInp" style="display:none" onchange="uploadSingle(this.files[0])">
     <button class="tbtn p" onclick="document.getElementById('singleInp').click()">📄 ফাইল বেছে নিন</button>
-    <div id="singleProgWrap" style="display:none;margin-top:10px;background:var(--s2);border-radius:8px;overflow:hidden;height:8px">
-      <div id="singleProgBar" style="height:100%;width:0%;background:var(--gr);transition:width .15s"></div>
-    </div>
     <div id="singleStatus" style="font-size:12px;color:var(--mu);margin-top:8px"></div>
   </div>
 
@@ -1920,7 +1823,6 @@ function goTab(id,btn){
   if(id==="logs") document.getElementById("lbox").scrollTop=document.getElementById("lbox").scrollHeight;
   if(id==="upload"){document.getElementById("uploadDir").textContent=curDir||"root";}
   if(id==="monitor") loadMonitor();
-  if(id==="home") loadRecentFiles();
 }
 function goUploadHere(){
   document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
@@ -1949,9 +1851,8 @@ function appendLog(e){
   const box=document.getElementById("lbox");
   const d=document.createElement("div");
   const cls={info:"li",success:"ls",error:"lr",warn:"lw"}[e.type||"info"]||"li";
-  const ico={info:"ℹ️",success:"✅",error:"🔴",warn:"⚠️"}[e.type||"info"]||"ℹ️";
   d.className="le "+cls;d.dataset.t=e.type||"info";
-  d.innerHTML='<span class="lico">'+ico+'</span><span class="lt">'+e.time+'</span><span class="lx">'+esc(e.text)+'</span>';
+  d.innerHTML='<span class="lt">'+e.time+'</span><span class="lx">'+esc(e.text)+'</span>';
   box.appendChild(d);
   if(autoScroll) box.scrollTop=box.scrollHeight;
 }
@@ -2052,28 +1953,6 @@ async function refresh(){
 
 // LIVE MONITOR
 function _mColor(pct){ return pct<60?"var(--gr)":pct<85?"var(--yw)":"var(--rd)"; }
-async function loadRecentFiles(){
-  try{
-    const d=await fetch("/api/files/recent?limit=8").then(r=>r.json());
-    const box=document.getElementById("recentFilesList");
-    if(!d.items?.length){ box.innerHTML='<div style="text-align:center;padding:10px;color:var(--mu)">কোনো ফাইল নেই</div>'; return; }
-    box.innerHTML=d.items.map(f=>
-      '<div onclick="goToFileFromHome(\''+f.path+'\')" style="display:flex;justify-content:space-between;align-items:center;padding:8px 4px;border-bottom:1px solid var(--bd);cursor:pointer">'
-      +'<span>'+langDot(f.name,false)+esc(f.name)+'</span>'
-      +'<span style="color:var(--mu);font-size:11px">'+fdt(f.mtime)+'</span>'
-      +'</div>'
-    ).join("");
-  }catch(e){}
-}
-function goToFileFromHome(p){
-  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
-  document.querySelectorAll(".page").forEach(pg=>pg.classList.remove("active"));
-  document.getElementById("pg-files").classList.add("active");
-  [...document.querySelectorAll(".tab")].find(b=>b.getAttribute("onclick")?.includes("'files'"))?.classList.add("active");
-  document.getElementById("fmView").style.display="block";
-  editF(p);
-}
-
 async function loadMonitor(){
   try{
     const d=await fetch("/api/system/live").then(r=>r.json());
@@ -2218,8 +2097,7 @@ async function loadFiles(dir){
   data.items.forEach(item=>{
     const fp=curDir?curDir+"/"+item.name:item.name;
     const row=document.createElement("div");row.className="frow";
-    const chk=selectMode?'<input type="checkbox" class="fchk" data-fp="'+fp+'" onclick="event.stopPropagation();updateBulkBar()" '+(selectedFiles.has(fp)?"checked":"")+' style="width:20px;height:20px;margin-right:8px">':"";
-    row.innerHTML=chk+'<span class="fi">'+ficon(item.name,item.isDir)+'</span>'
+    row.innerHTML='<span class="fi">'+ficon(item.name,item.isDir)+'</span>'
       +'<div class="fn"><div class="fn-name">'+langDot(item.name,item.isDir)+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?' · <span data-mtime="'+item.mtime+'">'+fdt(item.mtime)+'</span>':"")+'</div></div>'
       +'<div class="fa">'
       +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
@@ -2228,46 +2106,10 @@ async function loadFiles(dir){
       +'<button class="fab" onclick="event.stopPropagation();showCopy(\\''+fp+'\\')">📋</button>'
       +'<button class="fab del" onclick="event.stopPropagation();delItem(\\''+fp+'\\',\\''+item.name+'\\')">🗑</button>'
       +'</div>';
-    if(selectMode){
-      row.onclick=()=>{ const cb=row.querySelector(".fchk"); cb.checked=!cb.checked; updateBulkBar(); };
-    } else if(item.isDir) row.onclick=()=>loadFiles(fp);
+    if(item.isDir) row.onclick=()=>loadFiles(fp);
     else row.onclick=()=>editF(fp);
     list.appendChild(row);
   });
-}
-let selectMode=false, selectedFiles=new Set();
-function toggleSelectMode(){
-  selectMode=!selectMode;
-  document.getElementById("selModeBtn").className="tbtn"+(selectMode?" p":"");
-  document.getElementById("bulkBar").style.display=selectMode?"flex":"none";
-  if(!selectMode) selectedFiles.clear();
-  loadFiles(curDir);
-}
-function updateBulkBar(){
-  selectedFiles.clear();
-  document.querySelectorAll(".fchk:checked").forEach(cb=>selectedFiles.add(cb.dataset.fp));
-  document.getElementById("bulkCount").textContent=selectedFiles.size+"টা সিলেক্ট";
-}
-async function bulkDelete(){
-  if(!selectedFiles.size) return toast("❌ কিছু সিলেক্ট করো আগে","error");
-  if(!confirm(selectedFiles.size+"টা ফাইল/ফোল্ডার ডিলিট করবে? MongoDB থেকেও মুছে যাবে।")) return;
-  const d=await fetch("/api/files/bulk",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete",paths:[...selectedFiles]})}).then(r=>r.json());
-  toast(d.ok?"🗑 "+d.msg:"⚠️ "+d.msg,d.ok?"success":"warn");
-  selectedFiles.clear(); loadFiles(curDir);
-}
-function showBulkMoveModal(){
-  if(!selectedFiles.size) return toast("❌ কিছু সিলেক্ট করো আগে","error");
-  const dest=prompt("কোন ফোল্ডারে মুভ করবে? (path লিখো, root-এর জন্য খালি রাখো)","");
-  if(dest===null) return;
-  bulkMove(dest);
-}
-async function bulkMove(dest){
-  const d=await fetch("/api/files/bulk",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"move",paths:[...selectedFiles],destination:dest})}).then(r=>r.json());
-  toast(d.ok?"📂 "+d.msg:"⚠️ "+d.msg,d.ok?"success":"warn");
-  selectedFiles.clear(); loadFiles(curDir);
-}
-function downloadFolderZip(){
-  window.open("/api/files/zip?path="+encodeURIComponent(curDir||""));
 }
 
 async function editF(p){
@@ -2428,35 +2270,15 @@ async function uploadF(file){
   document.getElementById("fInp").value="";
 }
 
-function uploadSingle(file){
+async function uploadSingle(file){
   if(!file)return;
   const st=document.getElementById("singleStatus");
-  const wrap=document.getElementById("singleProgWrap"), bar=document.getElementById("singleProgBar");
-  wrap.style.display="block"; bar.style.width="0%"; bar.style.background="var(--gr)";
-  st.textContent="⏳ আপলোড হচ্ছে... 0%";
+  st.textContent="⏳ আপলোড হচ্ছে...";
   const fd=new FormData();fd.append("file",file);fd.append("path",curDir||"");
-  const xhr=new XMLHttpRequest();
-  xhr.upload.onprogress=e=>{
-    if(!e.lengthComputable) return;
-    const pct=Math.round((e.loaded/e.total)*100);
-    bar.style.width=pct+"%";
-    st.textContent="⏳ আপলোড হচ্ছে... "+pct+"% ("+fsz(e.loaded)+" / "+fsz(e.total)+")";
-  };
-  xhr.onload=()=>{
-    let d; try{ d=JSON.parse(xhr.responseText); }catch{ d={ok:false,error:"অপ্রত্যাশিত সার্ভার সাড়া"}; }
-    bar.style.background=d.ok?"var(--gr)":"var(--rd)"; bar.style.width="100%";
-    st.innerHTML=d.ok?'<span style="color:var(--gr)">✅ '+d.msg+'</span>':'<span style="color:var(--rd)">❌ '+(d.error||d.msg)+'</span>';
-    toast(d.ok?"✅ "+d.msg:"❌ "+(d.error||d.msg),d.ok?"success":"error");
-    document.getElementById("singleInp").value="";
-    setTimeout(()=>{wrap.style.display="none";},1500);
-  };
-  xhr.onerror=()=>{
-    bar.style.background="var(--rd)";
-    st.innerHTML='<span style="color:var(--rd)">❌ নেটওয়ার্ক সমস্যা — আবার চেষ্টা করো</span>';
-    toast("❌ আপলোড ব্যর্থ","error");
-  };
-  xhr.open("POST","/api/file/upload");
-  xhr.send(fd);
+  const d=await fetch("/api/file/upload",{method:"POST",body:fd}).then(r=>r.json());
+  st.innerHTML=d.ok?'<span style="color:var(--gr)">✅ '+d.msg+'</span>':'<span style="color:var(--rd)">❌ '+d.error+'</span>';
+  toast(d.ok?"✅ "+d.msg:"❌ "+d.error,d.ok?"success":"error");
+  document.getElementById("singleInp").value="";
 }
 
 async function uploadMulti(files){
@@ -2522,7 +2344,6 @@ document.addEventListener("keydown",e=>{
 
 // INIT
 connectWS();
-loadRecentFiles();
 refresh();
 setInterval(refresh,10000);
 </script>
